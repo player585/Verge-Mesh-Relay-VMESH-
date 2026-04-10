@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#00d17f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="description" content="VergeMesh Relay — Offline XVG payments over Meshtastic LoRa mesh">
+  <title>VergeMesh Relay</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- ── STATUS BAR ── -->
+  <header id="statusBar">
+    <div class="status-left">
+      <svg class="logo-icon" viewBox="0 0 32 32" width="28" height="28" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="VergeMesh Logo">
+        <circle cx="16" cy="16" r="14" stroke="#00d17f" stroke-width="2"/>
+        <path d="M10 12 L16 22 L22 12" stroke="#00d17f" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="10" cy="10" r="2" fill="#00d17f" opacity="0.6"/>
+        <circle cx="22" cy="10" r="2" fill="#00d17f" opacity="0.6"/>
+        <circle cx="16" cy="24" r="2" fill="#00d17f" opacity="0.6"/>
+        <line x1="10" y1="10" x2="22" y2="10" stroke="#00d17f" stroke-width="1" opacity="0.3"/>
+        <line x1="22" y1="10" x2="16" y2="24" stroke="#00d17f" stroke-width="1" opacity="0.3"/>
+        <line x1="16" y1="24" x2="10" y2="10" stroke="#00d17f" stroke-width="1" opacity="0.3"/>
+      </svg>
+      <span class="logo-text">VMESH</span>
+    </div>
+    <div class="status-right">
+      <span id="radioStatus" class="status-badge offline">⚠ No Radio</span>
+      <span id="netStatus" class="status-badge"></span>
+    </div>
+  </header>
+
+  <!-- ── SCREEN: HOME / DASHBOARD ── -->
+  <main id="screenHome" class="screen active">
+    <div class="balance-card">
+      <div class="balance-label">Available Balance</div>
+      <div class="balance-amount"><span id="balanceDisplay">—</span> <span class="balance-unit">XVG</span></div>
+      <div class="balance-meta">
+        <span id="cacheAge">No data yet</span>
+        <span id="addressShort" class="address-chip"></span>
+      </div>
+    </div>
+
+    <div class="action-grid">
+      <button class="action-btn primary" onclick="showScreen('screenSend')">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+        Send XVG
+      </button>
+      <button class="action-btn" onclick="showScreen('screenReceive')">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>
+        Request Payment
+      </button>
+      <button class="action-btn" onclick="refreshUTXOs()">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Fetch UTXOs
+      </button>
+      <button class="action-btn" onclick="checkTxStatus()">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+        Check TX
+      </button>
+    </div>
+
+    <div class="section-label">Recent Activity</div>
+    <div id="activityLog" class="activity-log">
+      <div class="empty-state">No transactions yet. Connect your radio to get started.</div>
+    </div>
+
+    <div class="bottom-actions">
+      <button class="link-btn" onclick="showScreen('screenSettings')">⚙ Settings</button>
+      <button class="link-btn" onclick="connectRadio()">📡 Connect Radio</button>
+    </div>
+  </main>
+
+  <!-- ── SCREEN: SEND FORM ── -->
+  <main id="screenSend" class="screen">
+    <div class="screen-header">
+      <button class="back-btn" onclick="showScreen('screenHome')">← Back</button>
+      <h2>Send XVG</h2>
+    </div>
+
+    <div class="form-group">
+      <label for="recipientAddr">Recipient Address</label>
+      <div class="input-row">
+        <input type="text" id="recipientAddr" placeholder="D..." autocomplete="off" spellcheck="false">
+        <button class="icon-btn" onclick="scanRecipientQR()" title="Scan QR">📷</button>
+      </div>
+      <div id="addrError" class="field-error"></div>
+    </div>
+
+    <div class="form-group">
+      <label for="sendAmount">Amount (XVG)</label>
+      <div class="input-row">
+        <input type="number" id="sendAmount" placeholder="0.00" step="0.00000001" min="0">
+        <button class="text-btn" onclick="setMaxAmount()">MAX</button>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label for="sendMemo">Memo (optional)</label>
+      <input type="text" id="sendMemo" placeholder="e.g. Coffee payment">
+    </div>
+
+    <div class="tx-summary">
+      <div class="summary-row"><span>Amount</span><span id="summaryAmount">0 XVG</span></div>
+      <div class="summary-row"><span>Network Fee</span><span id="summaryFee">0.1 XVG</span></div>
+      <div class="summary-row total"><span>Total</span><span id="summaryTotal">0.1 XVG</span></div>
+      <div class="summary-row"><span>Chunks</span><span id="summaryChunks">~3 LoRa packets</span></div>
+    </div>
+
+    <button id="buildTxBtn" class="btn-primary" onclick="buildTransaction()" disabled>Build Transaction</button>
+  </main>
+
+  <!-- ── SCREEN: TX PREVIEW ── -->
+  <main id="screenPreview" class="screen">
+    <div class="screen-header">
+      <button class="back-btn" onclick="showScreen('screenSend')">← Back</button>
+      <h2>Confirm Transaction</h2>
+    </div>
+
+    <div class="preview-card">
+      <div class="preview-row"><span class="preview-label">To</span><span id="previewTo" class="mono"></span></div>
+      <div class="preview-row"><span class="preview-label">Amount</span><span id="previewAmount"></span></div>
+      <div class="preview-row"><span class="preview-label">Fee</span><span id="previewFee"></span></div>
+      <div class="preview-row"><span class="preview-label">Chunks</span><span id="previewChunks"></span></div>
+    </div>
+
+    <div class="warning-box">
+      <strong>⚠ Verify on your ELLIPAL Titan screen</strong><br>
+      The Titan shows the exact destination address. That is the only address that matters.
+    </div>
+
+    <button class="btn-primary" onclick="showUnsignedQR()">Show QR for Titan Signing</button>
+  </main>
+
+  <!-- ── SCREEN: SHOW UNSIGNED QR ── -->
+  <main id="screenQRShow" class="screen">
+    <div class="screen-header">
+      <button class="back-btn" onclick="showScreen('screenPreview')">← Back</button>
+      <h2>Sign with Titan</h2>
+    </div>
+
+    <div class="qr-instruction">Show this QR to your ELLIPAL Titan</div>
+    <div id="unsignedQRContainer" class="qr-container"></div>
+    <div class="qr-instruction sub">After Titan signs → tap below to scan its screen</div>
+
+    <button class="btn-primary" onclick="scanTitanQR()">📷 Scan Titan Screen</button>
+
+    <div class="divider-or">or paste signed hex manually</div>
+    <textarea id="manualSignedHex" class="hex-input" placeholder="Paste signed transaction hex here..." rows="3"></textarea>
+    <button class="btn-secondary" onclick="useManualHex()">Use Pasted Hex</button>
+  </main>
+
+  <!-- ── SCREEN: SENDING / PROGRESS ── -->
+  <main id="screenSending" class="screen">
+    <div class="screen-header">
+      <h2>Broadcasting</h2>
+    </div>
+
+    <div class="progress-container">
+      <div class="progress-ring">
+        <svg viewBox="0 0 120 120">
+          <circle cx="60" cy="60" r="50" stroke="#1a2430" stroke-width="8" fill="none"/>
+          <circle id="progressCircle" cx="60" cy="60" r="50" stroke="#00d17f" stroke-width="8" fill="none"
+                  stroke-dasharray="314" stroke-dashoffset="314" stroke-linecap="round"
+                  transform="rotate(-90 60 60)"/>
+        </svg>
+        <span id="progressPercent" class="progress-text">0%</span>
+      </div>
+    </div>
+
+    <div id="sendingStatus" class="sending-status">Preparing...</div>
+
+    <div id="chunkLog" class="chunk-log"></div>
+
+    <button id="cancelSendBtn" class="btn-danger" onclick="cancelSend()">Cancel</button>
+  </main>
+
+  <!-- ── SCREEN: RESULT ── -->
+  <main id="screenResult" class="screen">
+    <div id="resultIcon" class="result-icon success">✓</div>
+    <h2 id="resultTitle">Broadcast Confirmed</h2>
+    <div id="resultMessage" class="result-message"></div>
+
+    <div id="resultTxid" class="txid-display"></div>
+
+    <div class="result-actions">
+      <button class="btn-primary" onclick="showScreen('screenHome')">Done</button>
+      <button class="btn-secondary" onclick="checkTxViaResult()">Check Status via Mesh</button>
+      <button class="btn-secondary" onclick="sendAnother()">Send Another</button>
+    </div>
+  </main>
+
+  <!-- ── SCREEN: RECEIVE / REQUEST PAYMENT ── -->
+  <main id="screenReceive" class="screen">
+    <div class="screen-header">
+      <button class="back-btn" onclick="showScreen('screenHome')">← Back</button>
+      <h2>Request Payment</h2>
+    </div>
+
+    <div class="form-group">
+      <label for="reqAmount">Amount (XVG, optional)</label>
+      <input type="number" id="reqAmount" placeholder="0.00" step="0.00000001" min="0">
+    </div>
+
+    <div class="form-group">
+      <label for="reqMemo">Memo (optional)</label>
+      <input type="text" id="reqMemo" placeholder="e.g. Fishing trip split">
+    </div>
+
+    <button class="btn-primary" onclick="generateRequestQR()">Generate Payment QR</button>
+
+    <div id="requestQRContainer" class="qr-container" style="display:none;"></div>
+    <div id="requestURI" class="mono uri-display" style="display:none;"></div>
+  </main>
+
+  <!-- ── SCREEN: CHECK TX ── -->
+  <main id="screenCheckTx" class="screen">
+    <div class="screen-header">
+      <button class="back-btn" onclick="showScreen('screenHome')">← Back</button>
+      <h2>Check Transaction</h2>
+    </div>
+
+    <div class="form-group">
+      <label for="checkTxid">Transaction ID (first 16 chars OK)</label>
+      <input type="text" id="checkTxid" placeholder="abc123..." autocomplete="off" spellcheck="false">
+    </div>
+
+    <button class="btn-primary" onclick="queryTxStatus()">Check via Mesh</button>
+
+    <div id="txCheckResult" class="result-card" style="display:none;">
+      <div class="preview-row"><span class="preview-label">Status</span><span id="txCheckStatus"></span></div>
+      <div class="preview-row"><span class="preview-label">Confirmations</span><span id="txCheckConfs"></span></div>
+    </div>
+  </main>
+
+  <!-- ── SCREEN: QR SCANNER (MODAL) ── -->
+  <main id="screenScanner" class="screen scanner-screen">
+    <div class="screen-header">
+      <button class="back-btn" onclick="closeScanner()">← Cancel</button>
+      <h2>Scan QR Code</h2>
+    </div>
+    <div class="scanner-viewport">
+      <video id="scannerVideo" autoplay playsinline></video>
+      <canvas id="scannerCanvas" style="display:none;"></canvas>
+      <div class="scanner-overlay">
+        <div class="scanner-frame"></div>
+      </div>
+    </div>
+    <div id="scannerStatus" class="scanner-status">Point camera at QR code...</div>
+  </main>
+
+  <!-- ── SCREEN: SETTINGS ── -->
+  <main id="screenSettings" class="screen">
+    <div class="screen-header">
+      <button class="back-btn" onclick="showScreen('screenHome')">← Back</button>
+      <h2>Settings</h2>
+    </div>
+
+    <div class="form-group">
+      <label for="settingsAddress">Your XVG Address</label>
+      <input type="text" id="settingsAddress" placeholder="D..." autocomplete="off" spellcheck="false">
+      <div class="field-hint">Used for UTXO lookups and balance display</div>
+    </div>
+
+    <div class="form-group">
+      <label for="settingsApiKey">NowNodes API Key</label>
+      <input type="text" id="settingsApiKey" placeholder="Your API key..." autocomplete="off">
+      <div class="field-hint">Free at <a href="https://nownodes.io" target="_blank" rel="noopener">nownodes.io</a> — needed for live UTXO fetch</div>
+    </div>
+
+    <div class="form-group">
+      <label for="settingsGatewayNode">Trusted Gateway Node ID (optional)</label>
+      <input type="text" id="settingsGatewayNode" placeholder="!abcd1234" autocomplete="off">
+      <div class="field-hint">Pin a specific gateway to prevent evil twin attacks</div>
+    </div>
+
+    <div class="form-group">
+      <label for="settingsRpcUrl">XVG RPC URL</label>
+      <input type="text" id="settingsRpcUrl" placeholder="https://xvg.nownodes.io" autocomplete="off">
+      <div class="field-hint">Default: NowNodes. Set to localhost:20102 for local Verge Core node</div>
+    </div>
+
+    <div class="settings-toggles">
+      <label class="toggle-row">
+        <span>Auto-recovery on TX failure</span>
+        <input type="checkbox" id="settingsAutoRecovery" checked>
+      </label>
+      <label class="toggle-row">
+        <span>Show cache age warnings</span>
+        <input type="checkbox" id="settingsCacheWarnings" checked>
+      </label>
+    </div>
+
+    <button class="btn-primary" onclick="saveSettings()">Save Settings</button>
+
+    <div class="settings-info">
+      <h3>About VMESH</h3>
+      <p>VergeMesh Relay v1.0 — Offline XVG payments over Meshtastic LoRa mesh networks.</p>
+      <p>Private keys never leave your signing device. The mesh is just a pipe.</p>
+      <p class="mono" style="font-size:0.75rem;opacity:0.5;">VMESH Protocol v1 · Built for Verge (XVG) · 915MHz US ISM</p>
+    </div>
+  </main>
+
+  <!-- ── TOAST NOTIFICATIONS ── -->
+  <div id="toast" class="toast"></div>
+
+  <!-- ── SPINNER OVERLAY ── -->
+  <div id="spinnerOverlay" class="spinner-overlay" style="display:none;">
+    <div class="spinner"></div>
+    <div id="spinnerMessage" class="spinner-message">Loading...</div>
+  </div>
+
+  <script src="lib/vmesh-protocol.js"></script>
+  <script src="lib/utxo-cache.js"></script>
+  <script src="lib/meshtastic-bridge.js"></script>
+  <script src="lib/qr-handler.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
