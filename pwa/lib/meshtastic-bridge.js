@@ -175,21 +175,29 @@ const MeshBridge = {
     const encoder = new TextEncoder();
     const textBytes = encoder.encode(text);
 
-    // Build Data submessage
+    // Build Data submessage (field numbers per mesh.proto Data message)
     const dataFields = [
-      ...this._encodeUint32(1, 1), // portnum = TEXT_MESSAGE_APP
+      ...this._encodeUint32(1, 1), // portnum = TEXT_MESSAGE_APP (1)
       ...this._encodeBytes(2, Array.from(textBytes)), // payload
     ];
 
     const packetId = this._packetId++;
 
-    // Build MeshPacket
+    // Build MeshPacket (field numbers per mesh.proto MeshPacket message)
+    // field 1: fixed32 from (omitted — radio fills in our node num)
+    // field 2: fixed32 to
+    // field 3: uint32 channel
+    // field 4: Data decoded (oneof payload_variant)
+    // field 6: fixed32 id
+    // field 9: uint32 hop_limit
+    // field 10: bool want_ack
     const meshPacket = [
-      ...this._encodeFixed32(2, destination),  // to
-      ...this._encodeBytes(3, dataFields),     // decoded (Data)
-      ...this._encodeUint32(6, packetId),      // id
-      ...this._encodeBool(7, true),            // want_ack
-      ...this._encodeUint32(9, channel),       // channel
+      ...this._encodeFixed32(2, destination),  // to (field 2, fixed32)
+      ...this._encodeUint32(3, channel),       // channel (field 3, uint32)
+      ...this._encodeBytes(4, dataFields),     // decoded (field 4, Data submessage)
+      ...this._encodeFixed32(6, packetId),     // id (field 6, fixed32)
+      ...this._encodeUint32(9, 3),             // hop_limit (field 9, uint32)
+      ...this._encodeBool(10, true),           // want_ack (field 10, bool)
     ];
 
     return { bytes: new Uint8Array(meshPacket), packetId };
@@ -267,11 +275,11 @@ const MeshBridge = {
 
     for (const f of fields) {
       switch (f.fieldNumber) {
-        case 1: pkt.from = f.value; break;   // from (fixed32)
-        case 2: pkt.to = f.value; break;     // to (fixed32)
-        case 3: pkt.decoded = this._parseData(f.value); break; // decoded (Data)
-        case 6: pkt.id = f.value; break;     // id
-        case 9: pkt.channel = f.value; break; // channel
+        case 1: pkt.from = f.value; break;    // from (fixed32)
+        case 2: pkt.to = f.value; break;      // to (fixed32)
+        case 3: pkt.channel = f.value; break; // channel (uint32)
+        case 4: pkt.decoded = this._parseData(f.value); break; // decoded (Data)
+        case 6: pkt.id = f.value; break;      // id (fixed32)
       }
     }
     return pkt;
