@@ -625,18 +625,27 @@ const MeshBridge = {
   // ── Public API ────────────────────────────────────────────────────
 
   async connect() {
-    try {
-      await this.connectBLE();
-      return 'ble';
-    } catch (bleErr) {
-      console.log('[MeshBridge] BLE failed, trying serial:', bleErr.message);
+    // Try BLE up to 3 times before giving up (GATT errors are often transient)
+    let lastBleErr;
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        await this.connectSerial();
-        return 'serial';
-      } catch (serialErr) {
-        throw new Error(`No radio found. BLE: ${bleErr.message}. Serial: ${serialErr.message}`);
+        console.log(`[MeshBridge] BLE connection attempt ${attempt}/3`);
+        await this.connectBLE();
+        return 'ble';
+      } catch (bleErr) {
+        lastBleErr = bleErr;
+        console.warn(`[MeshBridge] BLE attempt ${attempt} failed:`, bleErr.message);
+        if (bleErr.message.includes('User cancelled')) {
+          throw bleErr; // User hit cancel — don't retry
+        }
+        if (attempt < 3) {
+          console.log('[MeshBridge] Retrying BLE in 2 seconds...');
+          await new Promise(r => setTimeout(r, 2000));
+        }
       }
     }
+    // All BLE attempts failed — don't fall back to serial (confusing UX)
+    throw new Error(`Bluetooth connection failed after 3 attempts: ${lastBleErr.message}. Make sure Meshtastic app is closed and try again.`);
   },
 
   /**
