@@ -1,32 +1,460 @@
 /**
- * Meshtastic Bridge — Web Serial / Web Bluetooth connection to radio
+ * Meshtastic Bridge — Web Bluetooth connection to Meshtastic radio
  *
- * Uses the Meshtastic.js library for Web Serial (USB) or Web Bluetooth (BLE)
- * to communicate with stock Meshtastic firmware radios.
+ * Implements the Meshtastic BLE protocol using protobuf encoding.
+ * Connects via Web Bluetooth to a Meshtastic device, performs the
+ * config handshake, and sends/receives text messages over the mesh.
  *
- * Since @meshtastic/js doesn't ship a UMD build suitable for direct <script> use,
- * we implement a lightweight serial/BLE bridge using the Web Serial API and
- * Meshtastic Protobuf encoding directly.
+ * Protocol reference: https://meshtastic.org/docs/development/device/client-api/
  *
- * For the PWA MVP, we use a simplified approach:
- * - Web Serial API for USB connection
- * - Send/receive plain text messages via Meshtastic text channel
- * - VMESH protocol packets are just text messages with VMESH: prefix
+ * BLE Characteristics:
+ *   ToRadio:   f75c76d2-129e-4dad-a1dd-7866124401e7 (write)
+ *   FromRadio: 2c55e69e-4993-11ed-b878-0242ac120002 (read)
+ *   FromNum:   ed9da18c-a800-4f66-a670-aa7547e34453 (read,notify,write)
  */
 
 const MeshBridge = {
+  // Connection state
+  connected: false,
+  connectionType: null,
+  listeners: [],
+  _server: null,
+  _service: null,
+  _toRadio: null,
+  _fromRadio: null,
+  _fromNum: null,
+  _configComplete: false,
+  _myNodeNum: 0,
+  _configId: 0,
+  _packetId: 1000,
+
+  // BLE UUIDs
+  SERVICE_UUID:   '6ba1b218-15a8-461f-9fa8-5dcae273eafd',
+  TORADIO_UUID:   'f75c76d2-129e-4dad-a1dd-7866124401e7',
+  FROMRADIO_UUID: '2c55e69e-4993-11ed-b878-0242ac120002',
+  FROMNUM_UUID:   'ed9da18c-a800-4f66-a670-aa7547e34453',
+
+  // ── Protobuf Helpers ──────────────────────────────────────────────
+  // Minimal protobuf encoder/decoder for Meshtastic ToRadio/FromRadio
+  // Field types: 0=varint, 1=64bit, 2=length-delimited, 5=32bit
+
+  _encodeVarint(value) {
+    const bytes = [];
+    value = value >>> 0; // ensure unsigned
+    while (value > 0x7f) {
+      bytes.push((value & 0x7f) | 0x80);
+      value >>>= 7;
+    }
+    bytes.push(value & 0x7f);
+    return bytes;
+  },
+
+  _decodeVarint(buf, offset) {
+    let result = 0;
+    let shift = 0;
+    let pos = offset;
+    while (pos < buf.length) {
+      const byte = buf[pos];
+      result |= (byte & 0x7f) << shift;
+      pos++;
+      if ((byte & 0x80) === 0) break;
+      shift += 7;
+      if (shift > 35) break; // safety
+    }
+    return { value: result >>> 0, nextOffset: pos };
+  },
+
+  _encodeTag(fieldNumber, wireType) {
+    return this._encodeVarint((fieldNumber << 3) | wireType);
+  },
+
+  _encodeBytes(fieldNumber, data) {
+    const tag = this._encodeTag(fieldNumber, 2);
+    const len = this._encodeVarint(data.length);
+    return [...tag, ...len, ...data];
+  },
+
+  _encodeString(fieldNumber, str) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(str);
+    return this._encodeBytes(fieldNumber, Array.from(data));
+  },
+
+  _encodeUint32(fieldNumber, value) {
+    return [...this._encodeTag(fieldNumber, 0), ...this._encodeVarint(value)];
+  },
+
+  _encodeFixed32(fieldNumber, value) {
+    const tag = this._encodeTag(fieldNumber, 5);
+    const bytes = [
+      value & 0xff,
+      (value >> 8) & 0xff,
+      (value >> 16) & 0xff,
+      (value >> 24) & 0xff
+    ];
+    return [...tag, ...bytes];
+  },
+
+  _encodeBool(fieldNumber, value) {
+    return this._encodeUint32(fieldNumber, value ? 1 : 0);
+  },
+
+  /**
+   * Decode a protobuf message into fields
+   * Returns array of { fieldNumber, wireType, value }
+   */
+  _decodeMessage(buf) {
+    const fields = [];
+    let offset = 0;
+    while (offset < buf.length) {
+      const tagResult = this._decodeVarint(buf, offset);
+      offset = tagResult.nextOffset;
+      const fieldNumber = tagResult.value >> 3;
+      const wireType = tagResult.value & 0x7;
+
+      let value;
+      switch (wireType) {
+        case 0: { // varint
+          const r = this._decodeVarint(buf, offset);
+          value = r.value;
+          offset = r.nextOffset;
+          break;
+        }
+        case 1: { // 64-bit
+          value = buf.slice(offset, offset + 8);
+          offset += 8;
+          break;
+        }
+        case 2: { // length-delimited
+          const lenR = this._decodeVarint(buf, offset);
+          offset = lenR.nextOffset;
+          value = buf.slice(offset, offset + lenR.value);
+          offset += lenR.value;
+          break;
+        }
+        case 5: { // 32-bit fixed
+          value = buf[offset] | (buf[offset+1] << 8) | (buf[offset+2] << 16) | (buf[offset+3] << 24);
+          value = value >>> 0;
+          offset += 4;
+          break;
+        }
+        default:
+          console.warn('[MeshBridge] Unknown wire type', wireType, 'at offset', offset);
+          return fields; // can't continue
+      }
+      fields.push({ fieldNumber, wireType, value });
+    }
+    return fields;
+  },
+
+  // ── Meshtastic Protobuf Builders ──────────────────────────────────
+
+  /**
+   * Build ToRadio protobuf with want_config_id
+   * ToRadio { field 3: uint32 want_config_id }
+   */
+  _buildWantConfig(configId) {
+    return new Uint8Array(this._encodeUint32(3, configId));
+  },
+
+  /**
+   * Build a MeshPacket containing a text message
+   * MeshPacket:
+   *   field 1: fixed32 from (our node)
+   *   field 2: fixed32 to (destination, 0xFFFFFFFF = broadcast)
+   *   field 3: Data (decoded) {
+   *     field 1: PortNum (varint, TEXT_MESSAGE_APP = 1)
+   *     field 2: bytes payload (the text)
+   *     field 6: bool want_response = false
+   *   }
+   *   field 6: uint32 id (packet id)
+   *   field 7: bool want_ack = true
+   *   field 9: uint32 channel = 0
+   */
+  _buildTextMeshPacket(text, destination = 0xFFFFFFFF, channel = 0) {
+    const encoder = new TextEncoder();
+    const textBytes = encoder.encode(text);
+
+    // Build Data submessage
+    const dataFields = [
+      ...this._encodeUint32(1, 1), // portnum = TEXT_MESSAGE_APP
+      ...this._encodeBytes(2, Array.from(textBytes)), // payload
+    ];
+
+    const packetId = this._packetId++;
+
+    // Build MeshPacket
+    const meshPacket = [
+      ...this._encodeFixed32(2, destination),  // to
+      ...this._encodeBytes(3, dataFields),     // decoded (Data)
+      ...this._encodeUint32(6, packetId),      // id
+      ...this._encodeBool(7, true),            // want_ack
+      ...this._encodeUint32(9, channel),       // channel
+    ];
+
+    return { bytes: new Uint8Array(meshPacket), packetId };
+  },
+
+  /**
+   * Build ToRadio protobuf wrapping a MeshPacket
+   * ToRadio { field 1: MeshPacket packet }
+   */
+  _buildToRadioPacket(text, destination, channel) {
+    const { bytes: meshPacketBytes, packetId } = this._buildTextMeshPacket(text, destination, channel);
+    const toRadio = this._encodeBytes(1, Array.from(meshPacketBytes));
+    return { bytes: new Uint8Array(toRadio), packetId };
+  },
+
+  // ── FromRadio Decoder ─────────────────────────────────────────────
+
+  /**
+   * Parse a FromRadio protobuf and extract text messages
+   * FromRadio {
+   *   field 1: uint32 id
+   *   field 2: MeshPacket packet
+   *   field 5: MyNodeInfo my_info
+   *   field 6: NodeInfo node_info
+   *   field 8: Config config
+   *   field 9: LogRecord log_record
+   *   field 10: uint32 config_complete_id
+   *   field 11: bool rebooted
+   *   field 12: ModuleConfig moduleConfig
+   *   field 13: Channel channel
+   * }
+   */
+  _parseFromRadio(buf) {
+    const uint8 = new Uint8Array(buf);
+    const fields = this._decodeMessage(uint8);
+    const result = { type: 'unknown' };
+
+    for (const field of fields) {
+      switch (field.fieldNumber) {
+        case 1: // id
+          result.id = field.value;
+          break;
+        case 2: // MeshPacket
+          result.type = 'packet';
+          result.meshPacket = this._parseMeshPacket(field.value);
+          break;
+        case 5: // MyNodeInfo
+          result.type = 'my_info';
+          result.myInfo = this._parseMyNodeInfo(field.value);
+          break;
+        case 10: // config_complete_id
+          result.type = 'config_complete';
+          result.configCompleteId = field.value;
+          break;
+        case 11: // rebooted
+          result.type = 'rebooted';
+          break;
+      }
+    }
+    return result;
+  },
+
+  _parseMyNodeInfo(buf) {
+    const fields = this._decodeMessage(buf);
+    const info = {};
+    for (const f of fields) {
+      if (f.fieldNumber === 1) info.myNodeNum = f.value;
+    }
+    return info;
+  },
+
+  _parseMeshPacket(buf) {
+    const fields = this._decodeMessage(buf);
+    const pkt = { from: 0, to: 0, decoded: null, id: 0, channel: 0 };
+
+    for (const f of fields) {
+      switch (f.fieldNumber) {
+        case 1: pkt.from = f.value; break;   // from (fixed32)
+        case 2: pkt.to = f.value; break;     // to (fixed32)
+        case 3: pkt.decoded = this._parseData(f.value); break; // decoded (Data)
+        case 6: pkt.id = f.value; break;     // id
+        case 9: pkt.channel = f.value; break; // channel
+      }
+    }
+    return pkt;
+  },
+
+  _parseData(buf) {
+    const fields = this._decodeMessage(buf);
+    const data = { portnum: 0, payload: null, text: null };
+
+    for (const f of fields) {
+      switch (f.fieldNumber) {
+        case 1: data.portnum = f.value; break;  // portnum
+        case 2: // payload (bytes)
+          data.payload = f.value;
+          data.text = new TextDecoder().decode(new Uint8Array(f.value));
+          break;
+      }
+    }
+    return data;
+  },
+
+  // ── BLE Connection ────────────────────────────────────────────────
+
+  async connectBLE() {
+    if (!('bluetooth' in navigator)) {
+      throw new Error('Web Bluetooth not supported. Use Chrome on Android or desktop.');
+    }
+
+    try {
+      console.log('[MeshBridge] Requesting Bluetooth device...');
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [this.SERVICE_UUID] }],
+        optionalServices: [this.SERVICE_UUID]
+      });
+
+      console.log('[MeshBridge] Connecting to GATT server...');
+      this._server = await device.gatt.connect();
+
+      console.log('[MeshBridge] Getting Meshtastic service...');
+      this._service = await this._server.getPrimaryService(this.SERVICE_UUID);
+
+      // Get characteristics
+      this._toRadio = await this._service.getCharacteristic(this.TORADIO_UUID);
+      this._fromRadio = await this._service.getCharacteristic(this.FROMRADIO_UUID);
+      this._fromNum = await this._service.getCharacteristic(this.FROMNUM_UUID);
+
+      this.connected = true;
+      this.connectionType = 'ble';
+
+      // Handle disconnection
+      device.addEventListener('gattserverdisconnected', () => {
+        console.log('[MeshBridge] BLE disconnected');
+        this.connected = false;
+        this._configComplete = false;
+        this._dispatchPacket({ text: '__DISCONNECTED__', from: 'system', to: 'local' });
+      });
+
+      // Perform config handshake
+      await this._performConfigHandshake();
+
+      // Start listening for notifications
+      await this._fromNum.startNotifications();
+      this._fromNum.addEventListener('characteristicvaluechanged', () => {
+        this._drainFromRadio();
+      });
+
+      console.log('[MeshBridge] BLE connection complete, listening for packets');
+      return true;
+
+    } catch (e) {
+      this.connected = false;
+      throw new Error(`Bluetooth connection failed: ${e.message}`);
+    }
+  },
+
+  /**
+   * Perform the Meshtastic config handshake
+   * Send want_config_id, then drain FromRadio until config_complete
+   */
+  async _performConfigHandshake() {
+    this._configId = Math.floor(Math.random() * 0xFFFFFFFF);
+    console.log('[MeshBridge] Sending want_config_id:', this._configId);
+
+    const wantConfig = this._buildWantConfig(this._configId);
+    await this._toRadio.writeValue(wantConfig);
+
+    // Drain all config packets
+    let emptyCount = 0;
+    const maxReads = 200;
+    for (let i = 0; i < maxReads; i++) {
+      try {
+        const value = await this._fromRadio.readValue();
+        const buf = new Uint8Array(value.buffer);
+
+        if (buf.length === 0) {
+          emptyCount++;
+          if (emptyCount > 3) break;
+          await new Promise(r => setTimeout(r, 50));
+          continue;
+        }
+        emptyCount = 0;
+
+        const parsed = this._parseFromRadio(buf);
+        console.log('[MeshBridge] Config packet:', parsed.type);
+
+        if (parsed.type === 'my_info' && parsed.myInfo) {
+          this._myNodeNum = parsed.myInfo.myNodeNum;
+          console.log('[MeshBridge] My node num:', this._myNodeNum);
+        }
+
+        if (parsed.type === 'config_complete') {
+          this._configComplete = true;
+          console.log('[MeshBridge] Config complete');
+          break;
+        }
+
+        // Also check for incoming text messages during config
+        if (parsed.type === 'packet' && parsed.meshPacket?.decoded?.portnum === 1) {
+          const text = parsed.meshPacket.decoded.text;
+          if (text && text.startsWith('VMESH:')) {
+            this._dispatchPacket({
+              text,
+              from: parsed.meshPacket.from.toString(),
+              to: parsed.meshPacket.to.toString()
+            });
+          }
+        }
+
+      } catch (e) {
+        console.warn('[MeshBridge] Config read error:', e);
+        await new Promise(r => setTimeout(r, 100));
+      }
+    }
+  },
+
+  /**
+   * Read all available FromRadio packets
+   */
+  async _drainFromRadio() {
+    let emptyCount = 0;
+    for (let i = 0; i < 50; i++) {
+      try {
+        const value = await this._fromRadio.readValue();
+        const buf = new Uint8Array(value.buffer);
+
+        if (buf.length === 0) {
+          emptyCount++;
+          if (emptyCount > 2) break;
+          continue;
+        }
+        emptyCount = 0;
+
+        const parsed = this._parseFromRadio(buf);
+
+        if (parsed.type === 'packet' && parsed.meshPacket?.decoded) {
+          const data = parsed.meshPacket.decoded;
+          // TEXT_MESSAGE_APP = portnum 1
+          if (data.portnum === 1 && data.text) {
+            console.log('[MeshBridge] Received text:', data.text.substring(0, 80));
+            if (data.text.startsWith('VMESH:')) {
+              this._dispatchPacket({
+                text: data.text,
+                from: parsed.meshPacket.from.toString(),
+                to: parsed.meshPacket.to.toString()
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[MeshBridge] Read error:', e);
+        break;
+      }
+    }
+  },
+
+  // ── Serial Connection (USB) ───────────────────────────────────────
+
   port: null,
   reader: null,
   writer: null,
-  connected: false,
-  connectionType: null, // 'serial' or 'ble'
-  listeners: [],        // packet listeners
   _readLoopActive: false,
-  _incomingBuffer: '',
+  _serialBuffer: new Uint8Array(0),
 
-  /**
-   * Connect to Meshtastic radio via Web Serial (USB)
-   */
   async connectSerial() {
     if (!('serial' in navigator)) {
       throw new Error('Web Serial not supported. Use Chrome on Android or desktop.');
@@ -38,13 +466,11 @@ const MeshBridge = {
       this.connected = true;
       this.connectionType = 'serial';
 
-      // Set up writer
-      const encoder = new TextEncoderStream();
-      encoder.readable.pipeTo(this.port.writable);
-      this.writer = encoder.writable.getWriter();
+      // Start reading raw bytes
+      this._startSerialReadLoop();
 
-      // Start reading
-      this._startReadLoop();
+      // Perform config handshake over serial
+      await this._performSerialConfigHandshake();
 
       return true;
     } catch (e) {
@@ -53,85 +479,180 @@ const MeshBridge = {
     }
   },
 
-  /**
-   * Connect to Meshtastic radio via Web Bluetooth
-   */
-  async connectBLE() {
-    if (!('bluetooth' in navigator)) {
-      throw new Error('Web Bluetooth not supported on this browser.');
-    }
+  // Serial protocol framing: 0x94 0xC3 [MSB len] [LSB len] [protobuf data]
+  START1: 0x94,
+  START2: 0xC3,
 
-    try {
-      const device = await navigator.bluetooth.requestDevice({
-        filters: [{ services: ['6ba1b218-15a8-461f-9fa8-5dcae273eafd'] }],
-        optionalServices: ['6ba1b218-15a8-461f-9fa8-5dcae273eafd']
-      });
+  _frameSerialPacket(protobufBytes) {
+    const len = protobufBytes.length;
+    const frame = new Uint8Array(4 + len);
+    frame[0] = this.START1;
+    frame[1] = this.START2;
+    frame[2] = (len >> 8) & 0xff;
+    frame[3] = len & 0xff;
+    frame.set(protobufBytes, 4);
+    return frame;
+  },
 
-      const server = await device.gatt.connect();
-      const service = await server.getPrimaryService('6ba1b218-15a8-461f-9fa8-5dcae273eafd');
+  _startSerialReadLoop() {
+    if (this._readLoopActive) return;
+    this._readLoopActive = true;
 
-      // Meshtastic BLE characteristics
-      const toRadio = await service.getCharacteristic('f75c76d2-129e-4dad-a1dd-7866124401e7');
-      const fromRadio = await service.getCharacteristic('2c55e69e-4993-11ed-b878-0242ac120002');
-      const fromNum = await service.getCharacteristic('ed9da18c-a800-4f66-a670-aa7547e34453');
+    const readLoop = async () => {
+      const reader = this.port.readable.getReader();
+      try {
+        while (this._readLoopActive) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) this._processSerialBytes(value);
+        }
+      } catch (e) {
+        if (this._readLoopActive) {
+          console.error('[MeshBridge] Serial read error:', e);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    };
+    readLoop();
+  },
 
-      this._bleToRadio = toRadio;
-      this._bleFromRadio = fromRadio;
-      this.connected = true;
-      this.connectionType = 'ble';
+  _processSerialBytes(newBytes) {
+    // Append to buffer
+    const combined = new Uint8Array(this._serialBuffer.length + newBytes.length);
+    combined.set(this._serialBuffer);
+    combined.set(newBytes, this._serialBuffer.length);
+    this._serialBuffer = combined;
 
-      // Start BLE notification listener
-      await fromNum.startNotifications();
-      fromNum.addEventListener('characteristicvaluechanged', () => {
-        this._readBLEPacket();
-      });
+    // Look for framed packets
+    while (this._serialBuffer.length >= 4) {
+      // Find START1 START2
+      let startIdx = -1;
+      for (let i = 0; i < this._serialBuffer.length - 1; i++) {
+        if (this._serialBuffer[i] === this.START1 && this._serialBuffer[i+1] === this.START2) {
+          startIdx = i;
+          break;
+        }
+      }
 
-      return true;
-    } catch (e) {
-      this.connected = false;
-      throw new Error(`Bluetooth connection failed: ${e.message}`);
+      if (startIdx === -1) {
+        // No valid frame start found, keep last byte in case it's START1
+        this._serialBuffer = this._serialBuffer.slice(Math.max(0, this._serialBuffer.length - 1));
+        break;
+      }
+
+      // Discard bytes before frame start
+      if (startIdx > 0) {
+        this._serialBuffer = this._serialBuffer.slice(startIdx);
+      }
+
+      if (this._serialBuffer.length < 4) break;
+
+      const len = (this._serialBuffer[2] << 8) | this._serialBuffer[3];
+      if (len > 512) {
+        // Invalid, skip this START marker
+        this._serialBuffer = this._serialBuffer.slice(2);
+        continue;
+      }
+
+      if (this._serialBuffer.length < 4 + len) break; // need more data
+
+      const protobufData = this._serialBuffer.slice(4, 4 + len);
+      this._serialBuffer = this._serialBuffer.slice(4 + len);
+
+      // Parse FromRadio
+      try {
+        const parsed = this._parseFromRadio(protobufData);
+        this._handleParsedFromRadio(parsed);
+      } catch (e) {
+        console.warn('[MeshBridge] Serial parse error:', e);
+      }
     }
   },
 
-  /**
-   * Auto-connect: try serial first, then BLE
-   */
+  _handleParsedFromRadio(parsed) {
+    if (parsed.type === 'my_info' && parsed.myInfo) {
+      this._myNodeNum = parsed.myInfo.myNodeNum;
+      console.log('[MeshBridge] My node num:', this._myNodeNum);
+    }
+    if (parsed.type === 'config_complete') {
+      this._configComplete = true;
+      console.log('[MeshBridge] Config complete');
+    }
+    if (parsed.type === 'packet' && parsed.meshPacket?.decoded) {
+      const data = parsed.meshPacket.decoded;
+      if (data.portnum === 1 && data.text) {
+        console.log('[MeshBridge] Received text:', data.text.substring(0, 80));
+        if (data.text.startsWith('VMESH:')) {
+          this._dispatchPacket({
+            text: data.text,
+            from: parsed.meshPacket.from.toString(),
+            to: parsed.meshPacket.to.toString()
+          });
+        }
+      }
+    }
+  },
+
+  async _performSerialConfigHandshake() {
+    this._configId = Math.floor(Math.random() * 0xFFFFFFFF);
+    const wantConfig = this._buildWantConfig(this._configId);
+    const framed = this._frameSerialPacket(wantConfig);
+
+    // Write to serial
+    const writer = this.port.writable.getWriter();
+    await writer.write(framed);
+    writer.releaseLock();
+
+    // Wait for config complete
+    const start = Date.now();
+    while (!this._configComplete && Date.now() - start < 15000) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    if (!this._configComplete) {
+      console.warn('[MeshBridge] Config handshake timed out, continuing anyway');
+    }
+  },
+
+  // ── Public API ────────────────────────────────────────────────────
+
   async connect() {
     try {
-      await this.connectSerial();
-      return 'serial';
-    } catch (serialErr) {
+      await this.connectBLE();
+      return 'ble';
+    } catch (bleErr) {
+      console.log('[MeshBridge] BLE failed, trying serial:', bleErr.message);
       try {
-        await this.connectBLE();
-        return 'ble';
-      } catch (bleErr) {
-        throw new Error(`No radio found. Serial: ${serialErr.message}. BLE: ${bleErr.message}`);
+        await this.connectSerial();
+        return 'serial';
+      } catch (serialErr) {
+        throw new Error(`No radio found. BLE: ${bleErr.message}. Serial: ${serialErr.message}`);
       }
     }
   },
 
   /**
    * Send a text message over the mesh
-   * For the serial protocol, we encode as a Meshtastic text message
    */
   async sendText(text) {
     if (!this.connected) throw new Error('Radio not connected');
 
-    if (this.connectionType === 'serial' && this.writer) {
-      // Meshtastic serial protocol: send as text command
-      // Using the Meshtastic serial API format
-      const packet = this._buildSerialTextPacket(text);
-      await this.writer.write(packet);
-    } else if (this.connectionType === 'ble' && this._bleToRadio) {
-      const packet = this._buildBLETextPacket(text);
-      await this._bleToRadio.writeValue(packet);
+    if (this.connectionType === 'ble') {
+      const { bytes } = this._buildToRadioPacket(text, 0xFFFFFFFF, 0);
+      await this._toRadio.writeValue(bytes);
+      console.log('[MeshBridge] Sent via BLE:', text.substring(0, 60));
+    } else if (this.connectionType === 'serial') {
+      const { bytes } = this._buildToRadioPacket(text, 0xFFFFFFFF, 0);
+      const framed = this._frameSerialPacket(bytes);
+      const writer = this.port.writable.getWriter();
+      await writer.write(framed);
+      writer.releaseLock();
+      console.log('[MeshBridge] Sent via serial:', text.substring(0, 60));
     }
   },
 
   /**
-   * Register a listener for incoming packets
-   * @param {Function} callback - receives { text, from, to }
-   * @returns {Function} unsubscribe function
+   * Register a listener for incoming VMESH packets
    */
   onMessage(callback) {
     this.listeners.push(callback);
@@ -140,71 +661,23 @@ const MeshBridge = {
     };
   },
 
-  /**
-   * Disconnect from radio
-   */
   async disconnect() {
+    this._readLoopActive = false;
+    this._configComplete = false;
+    if (this._server) {
+      try { this._server.disconnect(); } catch {}
+    }
     if (this.port) {
       try { await this.port.close(); } catch {}
     }
     this.connected = false;
     this.connectionType = null;
+    this._server = null;
+    this._service = null;
+    this._toRadio = null;
+    this._fromRadio = null;
+    this._fromNum = null;
     this.port = null;
-    this.reader = null;
-    this.writer = null;
-  },
-
-  // ── Internal methods ──────────────────────────────────────────────────
-
-  _startReadLoop() {
-    if (this._readLoopActive) return;
-    this._readLoopActive = true;
-
-    const decoder = new TextDecoderStream();
-    this.port.readable.pipeTo(decoder.writable);
-    this.reader = decoder.readable.getReader();
-
-    const readLoop = async () => {
-      try {
-        while (this._readLoopActive) {
-          const { value, done } = await this.reader.read();
-          if (done) break;
-          if (value) this._processSerialData(value);
-        }
-      } catch (e) {
-        if (this._readLoopActive) {
-          console.error('[MeshBridge] Read error:', e);
-        }
-      }
-    };
-
-    readLoop();
-  },
-
-  _processSerialData(data) {
-    this._incomingBuffer += data;
-
-    // Look for complete lines (Meshtastic serial outputs newline-delimited)
-    let lines = this._incomingBuffer.split('\n');
-    this._incomingBuffer = lines.pop() || '';
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('VMESH:')) {
-        this._dispatchPacket({ text: trimmed, from: 'mesh', to: 'local' });
-      }
-    }
-  },
-
-  async _readBLEPacket() {
-    if (!this._bleFromRadio) return;
-    try {
-      const value = await this._bleFromRadio.readValue();
-      const text = new TextDecoder().decode(value);
-      if (text.startsWith('VMESH:')) {
-        this._dispatchPacket({ text, from: 'mesh', to: 'local' });
-      }
-    } catch {}
   },
 
   _dispatchPacket(packet) {
@@ -213,22 +686,6 @@ const MeshBridge = {
         console.error('[MeshBridge] Listener error:', e);
       }
     }
-  },
-
-  /**
-   * Build a Meshtastic serial text message packet
-   * Simplified: sends text as a raw serial command
-   * In production, this would use proper protobuf encoding
-   */
-  _buildSerialTextPacket(text) {
-    // Meshtastic serial interface expects protobuf-encoded ToRadio packets.
-    // For this MVP, we use the meshtastic CLI-compatible text format.
-    // The actual production version should use @meshtastic/js protobuf encoding.
-    return text + '\n';
-  },
-
-  _buildBLETextPacket(text) {
-    return new TextEncoder().encode(text);
   },
 
   /**
