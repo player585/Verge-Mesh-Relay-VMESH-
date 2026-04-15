@@ -173,8 +173,17 @@ function handleIncomingPacket(packet) {
   const parsed = VMESH.parsePacket(packet.text);
   if (!parsed) return;
 
-  console.log('[VMESH] Received:', parsed);
+  console.log('[VMESH] Received:', parsed.type, parsed.sessionId || '');
   logActivity('RX', `${parsed.type} ${parsed.sessionId || ''}`);
+
+  // Handle balance response — update dashboard immediately
+  if (parsed.type === 'BAL_RESP' && parsed.balance !== undefined) {
+    console.log('[VMESH] Balance update:', parsed.balance, 'XVG');
+    const balEl = document.getElementById('balanceDisplay');
+    balEl.textContent = parsed.balance > 0 ? parsed.balance.toFixed(2) : '\u2014';
+    document.getElementById('cacheAge').textContent = 'Just now (mesh)';
+    showToast(`Balance: ${parsed.balance} XVG`, 'success');
+  }
 }
 
 // ─── UTXO REFRESH ───────────────────────────────────────────────────────────

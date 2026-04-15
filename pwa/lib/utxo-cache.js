@@ -104,35 +104,33 @@ const UTXOCache = {
       return cached;
     }
 
-    // TIER 2 — Live internet fetch
+    // TIER 2 — Live internet fetch via Blockbook REST API
     if (navigator.onLine && apiKey) {
-      onStatus('Fetching UTXOs from network...');
+      onStatus('Fetching UTXOs from Blockbook...');
       try {
-        const response = await fetch(rpcUrl, {
-          method: 'POST',
-          headers: {
-            'api-key': apiKey,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'listunspent',
-            params: [1, 9999, [address]]
-          })
-        });
+        const response = await window.fetch(
+          `https://xvg-blockbook.nownodes.io/api/v2/utxo/${address}`,
+          { headers: { 'api-key': apiKey } }
+        );
 
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const json = await response.json();
-        const utxos = json.result || [];
+        const result = await response.json();
+
+        // Blockbook returns: [{txid, vout, value (satoshis string), confirmations}]
+        const utxos = result.map(u => ({
+          txid: u.txid,
+          vout: u.vout,
+          amount: parseInt(u.value || '0') / 1e8,
+          confirmations: u.confirmations || 0
+        }));
 
         // Filter out locally-known spent UTXOs
         const filtered = utxos.filter(u => !this.isSpent(u.txid, u.vout));
         this.setCache(filtered);
-        onStatus(`Fetched ${filtered.length} UTXOs from network`);
+        onStatus(`Fetched ${filtered.length} UTXOs from Blockbook`);
         return filtered;
       } catch (e) {
-        onStatus(`Internet fetch failed: ${e.message}. Trying mesh...`);
+        onStatus(`Blockbook fetch failed: ${e.message}. Trying mesh...`);
       }
     }
 
