@@ -315,6 +315,52 @@
   <script src="lib/utxo-cache.js"></script>
   <script src="lib/meshtastic-bridge.js"></script>
   <script src="lib/qr-handler.js"></script>
+  <!-- DEBUG LOG PANEL -->
+  <div id="debugPanel" style="position:fixed;bottom:0;left:0;right:0;max-height:40vh;overflow-y:auto;background:#0a0a0a;color:#0f0;font-family:'JetBrains Mono',monospace;font-size:10px;padding:8px;z-index:9999;border-top:2px solid #00d17f;display:none;">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+      <b style="color:#00d17f;">DEBUG LOG</b>
+      <button onclick="document.getElementById('debugPanel').style.display='none'" style="background:none;border:none;color:#f44;font-size:12px;cursor:pointer;">X</button>
+    </div>
+    <div id="debugLog"></div>
+  </div>
+  <script>
+    // Debug logger — captures MeshBridge logs on screen
+    const _origLog = console.log;
+    const _origWarn = console.warn;
+    const _origErr = console.error;
+    function debugAppend(msg, color) {
+      const panel = document.getElementById('debugPanel');
+      const log = document.getElementById('debugLog');
+      if (!panel || !log) return;
+      panel.style.display = 'block';
+      const line = document.createElement('div');
+      line.style.color = color || '#0f0';
+      line.style.borderBottom = '1px solid #1a1a1a';
+      line.style.padding = '2px 0';
+      line.style.wordBreak = 'break-all';
+      const ts = new Date().toLocaleTimeString();
+      line.textContent = `[${ts}] ${msg}`;
+      log.appendChild(line);
+      panel.scrollTop = panel.scrollHeight;
+      // Keep max 100 lines
+      while (log.children.length > 100) log.removeChild(log.firstChild);
+    }
+    console.log = function(...args) {
+      _origLog.apply(console, args);
+      const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+      if (msg.includes('MeshBridge') || msg.includes('VMESH')) debugAppend(msg, '#0f0');
+    };
+    console.warn = function(...args) {
+      _origWarn.apply(console, args);
+      const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+      if (msg.includes('MeshBridge') || msg.includes('VMESH')) debugAppend(msg, '#ff0');
+    };
+    console.error = function(...args) {
+      _origErr.apply(console, args);
+      const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+      debugAppend(msg, '#f44');
+    };
+  </script>
   <script src="app.js"></script>
 </body>
 </html>
