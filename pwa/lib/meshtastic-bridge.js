@@ -422,40 +422,50 @@ const MeshBridge = {
   /**
    * Read all available FromRadio packets
    */
+  _drainActive: false,
+
   async _drainFromRadio() {
+    // Prevent concurrent drains (polling + notification can overlap)
+    if (this._drainActive) return;
+    this._drainActive = true;
+
     let emptyCount = 0;
-    for (let i = 0; i < 50; i++) {
-      try {
-        const value = await this._fromRadio.readValue();
-        const buf = new Uint8Array(value.buffer);
+    try {
+      for (let i = 0; i < 50; i++) {
+        try {
+          const value = await this._fromRadio.readValue();
+          const buf = new Uint8Array(value.buffer);
 
-        if (buf.length === 0) {
-          emptyCount++;
-          if (emptyCount > 2) break;
-          continue;
-        }
-        emptyCount = 0;
+          if (buf.length === 0) {
+            emptyCount++;
+            if (emptyCount > 2) break;
+            continue;
+          }
+          emptyCount = 0;
 
-        const parsed = this._parseFromRadio(buf);
+          const parsed = this._parseFromRadio(buf);
 
-        if (parsed.type === 'packet' && parsed.meshPacket?.decoded) {
-          const data = parsed.meshPacket.decoded;
-          // TEXT_MESSAGE_APP = portnum 1
-          if (data.portnum === 1 && data.text) {
-            console.log('[MeshBridge] Received text:', data.text.substring(0, 80));
-            if (data.text.startsWith('VMESH:')) {
-              this._dispatchPacket({
-                text: data.text,
-                from: parsed.meshPacket.from.toString(),
-                to: parsed.meshPacket.to.toString()
-              });
+          if (parsed.type === 'packet' && parsed.meshPacket?.decoded) {
+            const data = parsed.meshPacket.decoded;
+            // TEXT_MESSAGE_APP = portnum 1
+            if (data.portnum === 1 && data.text) {
+              console.log('[MeshBridge] Received text:', data.text.substring(0, 80));
+              if (data.text.startsWith('VMESH:')) {
+                this._dispatchPacket({
+                  text: data.text,
+                  from: parsed.meshPacket.from.toString(),
+                  to: parsed.meshPacket.to.toString()
+                });
+              }
             }
           }
+        } catch (e) {
+          // Silently break on read errors (normal when no data available)
+          break;
         }
-      } catch (e) {
-        console.warn('[MeshBridge] Read error:', e);
-        break;
       }
+    } finally {
+      this._drainActive = false;
     }
   },
 
