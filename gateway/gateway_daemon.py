@@ -35,6 +35,7 @@ from datetime import datetime
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 NOWNODES_KEY       = os.environ.get("NOWNODES_KEY", "")
 XVG_RPC_URL        = os.environ.get("XVG_RPC_URL", "https://xvg.nownodes.io")
+XVG_BLOCKBOOK_URL  = os.environ.get("XVG_BLOCKBOOK_URL", "https://xvg-blockbook.nownodes.io")
 RATE_LIMIT_SECONDS = 5       # Min seconds between requests from same node
 MAX_SESSIONS       = 50      # Max concurrent sessions before cleanup
 SESSION_TIMEOUT    = 300     # Seconds before stale sessions are purged
@@ -227,24 +228,47 @@ def handle_end(session_id: str, interface):
     cleanup_session(session_id)
 
 
+def blockbook_get(path: str):
+    """Call NowNodes Blockbook REST API."""
+    url = f"{XVG_BLOCKBOOK_URL}{path}"
+    headers = {"api-key": NOWNODES_KEY} if NOWNODES_KEY else {}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        log.error(f"Blockbook GET failed ({path}): {e}")
+        return None
+
+
 def handle_utxo_req(session_id: str, address: str, interface):
-    """Fetch UTXOs for address and return over mesh."""
+    """Fetch UTXOs for address via Blockbook API and return over mesh."""
     log.info(f"UTXO request for {address[:12]}...")
 
     try:
-        result = rpc_call("listunspent", [1, 9999, [address]])
-        utxos = result.get("result", [])
+        # Use Blockbook REST API: GET /api/v2/utxo/{address}
+        result = blockbook_get(f"/api/v2/utxo/{address}")
 
-        # Minify — only send what PWA needs
-        minimal = [
-            {"txid": u["txid"], "vout": u["vout"],
-             "amount": u["amount"], "confirmations": u["confirmations"]}
-            for u in utxos
-        ]
+        if result is None:
+            interface.sendText(f"VMESH:ERR:{session_id}:api_unavailable")
+            return
+
+        # Blockbook returns array of UTXOs directly
+        # Each has: txid, vout, value (satoshis string), confirmations, height
+        minimal = []
+        for u in result:
+            amount = int(u.get("value", "0")) / 1e8  # satoshis → XVG
+            minimal.append({
+                "txid": u["txid"],
+                "vout": u["vout"],
+                "amount": round(amount, 8),
+                "confirmations": u.get("confirmations", 0)
+            })
+
         data = json.dumps(minimal, separators=(',', ':'))
         send_chunked("VMESH:UTXO", session_id, data, interface)
         stats["utxo_served"] += 1
-        log.info(f"Sent {len(utxos)} UTXOs for {address[:12]}...")
+        log.info(f"Sent {len(minimal)} UTXOs for {address[:12]}...")
 
     except Exception as e:
         log.error(f"UTXO fetch failed: {e}")
@@ -252,11 +276,15 @@ def handle_utxo_req(session_id: str, address: str, interface):
 
 
 def handle_bal_req(session_id: str, address: str, interface):
-    """Return XVG balance for address."""
+    """Return XVG balance for address via Blockbook."""
     try:
-        result = rpc_call("listunspent", [1, 9999, [address]])
-        utxos = result.get("result", [])
-        balance = round(sum(u["amount"] for u in utxos), 8)
+        result = blockbook_get(f"/api/v2/address/{address}?details=basic")
+        if result is None:
+            interface.sendText(f"VMESH:ERR:{session_id}:api_unavailable")
+            return
+
+        # Blockbook returns balance in satoshis as string
+        balance = round(int(result.get("balance", "0")) / 1e8, 8)
         interface.sendText(f"VMESH:BAL_RESP:{session_id}:{balance}")
         log.info(f"Balance for {address[:12]}...: {balance} XVG")
 
@@ -265,40 +293,60 @@ def handle_bal_req(session_id: str, address: str, interface):
 
 
 def handle_tx_req(session_id: str, txid: str, interface):
-    """Return confirmation count and status for a TXID."""
+    """Return confirmation count and status for a TXID via Blockbook."""
     try:
-        result = rpc_call("getrawtransaction", [txid, 1])
-        tx = result.get("result", {})
-        confs = tx.get("confirmations", 0)
+        result = blockbook_get(f"/api/v2/tx/{txid}")
+        if result is None:
+            interface.sendText(f"VMESH:TX_RESP:{session_id}:-1:not_found")
+            return
+
+        confs = result.get("confirmations", 0)
         status = "confirmed" if confs > 0 else "mempool"
         interface.sendText(f"VMESH:TX_RESP:{session_id}:{confs}:{status}")
         log.info(f"TX status for {txid[:12]}...: {confs} confs ({status})")
 
     except Exception as e:
+        log.error(f"TX lookup failed: {e}")
         interface.sendText(f"VMESH:TX_RESP:{session_id}:-1:not_found")
 
 
 def handle_lasttx_req(session_id: str, address: str, interface):
-    """Return the most recent TX for an address."""
+    """Return the most recent TX for an address via Blockbook."""
     try:
-        result = rpc_call("listtransactions", ["*", 10, 0, True])
-        txs = result.get("result", [])
-        relevant = [t for t in txs if t.get("address") == address]
+        # Blockbook: get address with last few txids
+        result = blockbook_get(f"/api/v2/address/{address}?details=txs&pageSize=1")
+        if result is None:
+            interface.sendText(f"VMESH:ERR:{session_id}:api_unavailable")
+            return
 
-        if relevant:
-            t = relevant[0]
+        txs = result.get("transactions", [])
+        if txs:
+            t = txs[0]
+            # Determine direction: check if any vin belongs to this address
+            is_send = any(
+                addr == address
+                for vin in t.get("vin", [])
+                for addr in vin.get("addresses", [])
+            )
+            # Calculate amount from vout for this address
+            amount = 0
+            for vout in t.get("vout", []):
+                if address in vout.get("addresses", []):
+                    amount += float(vout.get("value", "0"))
+
             data = json.dumps({
                 "txid":          t["txid"][:16],
-                "amount":        abs(t["amount"]),
-                "direction":     t["category"],
+                "amount":        round(amount, 8),
+                "direction":     "send" if is_send else "receive",
                 "confirmations": t.get("confirmations", 0),
-                "time":          t.get("time", 0)
+                "time":          t.get("blockTime", 0)
             }, separators=(',', ':'))
             send_chunked("VMESH:LASTTX", session_id, data, interface)
         else:
             interface.sendText(f"VMESH:LASTTX_RESP:{session_id}:none")
 
     except Exception as e:
+        log.error(f"LASTTX fetch failed: {e}")
         interface.sendText(f"VMESH:ERR:{session_id}:api_unavailable")
 
 
@@ -384,7 +432,8 @@ def print_banner():
 ║  Bridging LoRa Mesh → XVG Blockchain          ║
 ╚═══════════════════════════════════════════════╝
     """)
-    log.info(f"RPC endpoint: {XVG_RPC_URL}")
+    log.info(f"RPC endpoint (broadcast only): {XVG_RPC_URL}")
+    log.info(f"Blockbook endpoint: {XVG_BLOCKBOOK_URL}")
     log.info(f"NowNodes key: {'configured' if NOWNODES_KEY else 'NOT SET'}")
     log.info(f"Rate limit: {RATE_LIMIT_SECONDS}s per node")
     log.info(f"Max sessions: {MAX_SESSIONS}")
