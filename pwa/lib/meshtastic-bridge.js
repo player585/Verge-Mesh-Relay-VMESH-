@@ -346,6 +346,10 @@ const MeshBridge = {
         this._drainFromRadio();
       });
 
+      // Also start a polling loop as backup — some Android BLE stacks
+      // don't reliably fire fromNum notifications for incoming mesh packets
+      this._startBLEPolling();
+
       console.log('[MeshBridge] BLE connection complete, listening for packets');
       return true;
 
@@ -678,9 +682,27 @@ const MeshBridge = {
     };
   },
 
+  _blePollingInterval: null,
+
+  _startBLEPolling() {
+    if (this._blePollingInterval) clearInterval(this._blePollingInterval);
+    this._blePollingInterval = setInterval(() => {
+      if (this.connected && this.connectionType === 'ble' && this._fromRadio) {
+        this._drainFromRadio();
+      } else {
+        clearInterval(this._blePollingInterval);
+        this._blePollingInterval = null;
+      }
+    }, 3000); // Poll every 3 seconds
+  },
+
   async disconnect() {
     this._readLoopActive = false;
     this._configComplete = false;
+    if (this._blePollingInterval) {
+      clearInterval(this._blePollingInterval);
+      this._blePollingInterval = null;
+    }
     if (this._server) {
       try { this._server.disconnect(); } catch {}
     }
