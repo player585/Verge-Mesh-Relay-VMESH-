@@ -167,7 +167,9 @@ def handle_chunk(session_id: str, n: str, data: str):
     """Store an incoming TX chunk."""
     if session_id in tx_buffers:
         tx_buffers[session_id][int(n)] = data
-        log.debug(f"Session {session_id}: CHUNK {n} received ({len(data)} chars)")
+        log.info(f"Session {session_id}: CHUNK {n} received ({len(data)} chars)")
+    else:
+        log.warning(f"Session {session_id}: CHUNK {n} received but no active session")
 
 
 def handle_end(session_id: str, interface):
@@ -373,15 +375,10 @@ def on_receive(packet, interface):
         if not text.startswith("VMESH:"):
             return  # Not a VMESH packet — ignore
 
-        # Rate limiting
-        if not rate_check(node_id):
-            log.debug(f"Rate-limited node {node_id}")
-            return
-
         parts = text.split(":")
         log.debug(f"Received from {node_id}: {text[:80]}...")
 
-        # ── TX Broadcast ──
+        # ── TX Broadcast (no rate limiting — chunks arrive rapidly) ──
         if text.startswith("VMESH:START:"):
             sid = parts[2]
             tc = parts[3].split("/")
@@ -399,8 +396,11 @@ def on_receive(packet, interface):
                 target=handle_end, args=(sid, interface), daemon=True
             ).start()
 
-        # ── Data Requests ──
+        # ── Data Requests (rate-limited to prevent abuse) ──
         elif text.startswith("VMESH:UTXO_REQ:"):
+            if not rate_check(node_id):
+                log.debug(f"Rate-limited UTXO_REQ from {node_id}")
+                return
             sid, address = parts[2], parts[3]
             threading.Thread(
                 target=handle_utxo_req,
@@ -408,6 +408,9 @@ def on_receive(packet, interface):
             ).start()
 
         elif text.startswith("VMESH:BAL_REQ:"):
+            if not rate_check(node_id):
+                log.debug(f"Rate-limited BAL_REQ from {node_id}")
+                return
             sid, address = parts[2], parts[3]
             threading.Thread(
                 target=handle_bal_req,
@@ -415,6 +418,9 @@ def on_receive(packet, interface):
             ).start()
 
         elif text.startswith("VMESH:TX_REQ:"):
+            if not rate_check(node_id):
+                log.debug(f"Rate-limited TX_REQ from {node_id}")
+                return
             sid, txid = parts[2], parts[3]
             threading.Thread(
                 target=handle_tx_req,
@@ -422,6 +428,9 @@ def on_receive(packet, interface):
             ).start()
 
         elif text.startswith("VMESH:LASTTX_REQ:"):
+            if not rate_check(node_id):
+                log.debug(f"Rate-limited LASTTX_REQ from {node_id}")
+                return
             sid, address = parts[2], parts[3]
             threading.Thread(
                 target=handle_lasttx_req,
