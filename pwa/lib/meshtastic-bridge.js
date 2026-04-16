@@ -55,11 +55,16 @@ const MeshBridge = {
     let pos = offset;
     while (pos < buf.length) {
       const byte = buf[pos];
-      result |= (byte & 0x7f) << shift;
       pos++;
+      if (shift < 32) {
+        // Only accumulate bits that fit in 32-bit result
+        result |= (byte & 0x7f) << shift;
+      }
+      // Always consume all continuation bytes even if we can't store them
+      // (protobuf int32 negatives are encoded as 10-byte 64-bit varints)
       if ((byte & 0x80) === 0) break;
       shift += 7;
-      if (shift > 35) break; // safety
+      if (shift > 63) break; // safety: max 10 bytes for a varint
     }
     return { value: result >>> 0, nextOffset: pos };
   },
@@ -138,6 +143,10 @@ const MeshBridge = {
           offset += 4;
           break;
         }
+        case 3: // start group (deprecated but must skip)
+        case 4: // end group (deprecated but must skip)
+          // Groups are deprecated in proto3 but we still need to not choke on them
+          break;
         default:
           console.warn('[MeshBridge] Unknown wire type', wireType, 'at offset', offset);
           return fields; // can't continue
