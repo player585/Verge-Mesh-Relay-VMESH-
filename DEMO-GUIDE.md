@@ -147,9 +147,16 @@ To demonstrate the full mesh relay visually:
 ### Back on the Phone:
 13. Tap **Scan Signed QR** in the PWA
 14. Scan the signed QR from the ELLIPAL screen
-15. The PWA broadcasts the signed transaction over mesh:
+15. The PWA **assembles** the complete signed TX from ELLIPAL's raw signature:
+    - Computes sighash (double SHA-256 of unsigned TX)
+    - Recovers compressed public key from (r, s, sighash)
+    - DER-encodes signature, builds P2PKH scriptSig
+    - Inserts scriptSig into unsigned TX → complete broadcastable TX
+16. The PWA broadcasts the complete signed TX over mesh:
     - Phone → BLE → T-Echo → LoRa → Heltec → Pi → Verge Network
-16. Wait for the ACK from the gateway confirming broadcast
+17. Wait for the ACK from the gateway confirming broadcast
+
+**Note (v3.5):** ELLIPAL returns a raw ECDSA signature (r || s = 64 bytes), NOT a complete signed transaction. The PWA must assemble the final TX locally using secp256k1 public key recovery. This is because ELLIPAL's own web app sends raw signatures to their backend (`wallet.ellipal.com/api/transaction`) which does the assembly — we replicate that logic client-side.
 
 **ELLIPAL QR Format (v3.2):**
 - Uses `elp://tosign/XVG/address/base64_tx/XVG/8` URI scheme
@@ -177,3 +184,6 @@ To demonstrate the full mesh relay visually:
 | v3.0 | ELLIPAL bridge: QR generation + signed QR parsing |
 | v3.1 | Fix ELLIPAL parsing: TX version 1, P2PKH scriptSig in inputs |
 | v3.2 | Fix dual QR scanning: revert to empty scriptSig, MAX_QR_BYTES 140→350, single QR for typical TX |
+| v3.3 | Fix scanner race condition: closeScanner no longer rejects before scanResolve fires |
+| v3.4 | BLE GATT write retry (3 attempts with backoff), gateway rate limiter removed from TX flow |
+| v3.5 | TX assembler: ELLIPAL returns raw r\|\|s signature, not complete TX. Added secp256k1 pubkey recovery, DER encoding, scriptSig assembly in PWA |
