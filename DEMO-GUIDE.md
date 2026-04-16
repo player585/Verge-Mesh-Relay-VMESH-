@@ -124,3 +124,52 @@ To demonstrate the full mesh relay visually:
 - Make sure your XVG address is set in Settings
 - Make sure NowNodes API key is entered
 - Tap "Fetch UTXOs" — the balance comes from the UTXO data
+
+---
+
+## Step 7: Demo — Send Transaction with ELLIPAL Signing
+
+1. Tap **Send** on the home screen
+2. Enter recipient address: `DLv25ww5CipJngsKMYemBTBWH14CUpucxX`
+3. Enter amount: `1.585` XVG
+4. Tap **Build Transaction**
+5. Review the preview — shows recipient, amount, fee, and QR page count
+6. Tap **Show QR for ELLIPAL** — this generates the ELLIPAL-compatible QR code(s)
+
+### On the ELLIPAL EC02:
+7. Open the Verge (XVG) wallet on your ELLIPAL
+8. Choose **Scan to Sign**
+9. Scan the QR code(s) displayed on your phone
+10. Review the transaction details on the ELLIPAL screen
+11. Confirm the signing on the ELLIPAL
+12. The ELLIPAL displays a **Signed QR code**
+
+### Back on the Phone:
+13. Tap **Scan Signed QR** in the PWA
+14. Scan the signed QR from the ELLIPAL screen
+15. The PWA broadcasts the signed transaction over mesh:
+    - Phone → BLE → T-Echo → LoRa → Heltec → Pi → Verge Network
+16. Wait for the ACK from the gateway confirming broadcast
+
+**ELLIPAL QR Format (v3.1):**
+- Uses `elp://tosign/XVG/address/base64_tx/XVG/8` URI scheme
+- TX version 1 (standard Verge format)
+- Includes nTime timestamp field (Verge-specific, PeerCoin heritage)
+- ScriptSig contains sender's P2PKH scriptPubKey (signing preparation)
+- Base64 uses modified encoding: `/` replaced with `_`
+- Multi-page QRs split at 140-character boundaries
+
+### ELLIPAL "signature data parsing failed"
+- **Fixed in v3.1** — this was caused by TX version 2 (should be 1) and empty scriptSig
+- Clear site data on phone to get the v3.1 update
+- If still failing, check that the ELLIPAL firmware supports XVG (v2.3.0+ confirmed)
+
+---
+
+## Version History
+
+| Version | Changes |
+|---------|--------|
+| v2.6 | Compact UTXO_RESP, checksum tolerance |
+| v3.0 | ELLIPAL bridge: QR generation + signed QR parsing |
+| v3.1 | Fix ELLIPAL parsing: TX version 1, P2PKH scriptSig in inputs |
