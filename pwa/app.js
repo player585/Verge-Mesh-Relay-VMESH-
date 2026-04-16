@@ -411,26 +411,33 @@ async function buildTransaction() {
     return;
   }
 
-  // Build unsigned TX preview
-  // Note: The actual TX hex construction happens on the signing device (ELLIPAL Titan
-  // or Verge Core CLI). The PWA shows the details and generates a QR for the signer.
-  const txData = {
-    inputs: selection.selected.map(u => ({ txid: u.txid, vout: u.vout })),
-    outputs: {
-      [recipient]: amount,
-      ...(selection.change > 0.00001 ? { [s.address]: selection.change } : {})
-    },
-    fee: VMESH.XVG_FEE
+  // Build ELLIPAL-compatible unsigned TX
+  const inputs = selection.selected.map(u => ({ txid: u.txid, vout: u.vout }));
+  const outputs = {
+    [recipient]: amount,
+    ...(selection.change > 0.00001 ? { [s.address]: selection.change } : {})
   };
 
-  // Store for later
-  unsignedTxHex = JSON.stringify(txData);
+  // Store structured TX data for ELLIPAL QR generation
+  window._pendingTx = { inputs, outputs, address: s.address };
+
+  // Build the ELLIPAL QR URIs now so we can report page count
+  try {
+    window._ellipalURIs = EllipalBridge.buildTosignURIs(s.address, inputs, outputs);
+  } catch (e) {
+    console.error('[ELLIPAL] Failed to build tosign URI:', e);
+    showToast('Failed to build ELLIPAL QR: ' + e.message, 'error');
+    return;
+  }
 
   // Show preview
   document.getElementById('previewTo').textContent = recipient;
   document.getElementById('previewAmount').textContent = `${amount.toFixed(8)} XVG`;
   document.getElementById('previewFee').textContent = `${VMESH.XVG_FEE} XVG`;
-  document.getElementById('previewChunks').textContent = `~${VMESH.estimateChunks(452)} LoRa packets`;
+  const qrPages = window._ellipalURIs.length;
+  document.getElementById('previewChunks').textContent = qrPages === 1
+    ? '1 QR page'
+    : `${qrPages} QR pages (swipe on ELLIPAL)`;
 
   showScreen('screenPreview');
   logActivity('BUILD', `${amount} XVG → ${recipient.slice(0, 8)}...`);
@@ -438,7 +445,41 @@ async function buildTransaction() {
 
 function showUnsignedQR() {
   const container = document.getElementById('unsignedQRContainer');
-  QRHandler.generateQR(container, unsignedTxHex, 280);
+  container.innerHTML = '';
+
+  if (!window._ellipalURIs || window._ellipalURIs.length === 0) {
+    showToast('No transaction to sign — go back and build one', 'error');
+    return;
+  }
+
+  // Generate one QR per ELLIPAL page
+  const uris = window._ellipalURIs;
+
+  if (uris.length === 1) {
+    // Single QR
+    QRHandler.generateQR(container, uris[0], 280);
+    console.log('[ELLIPAL] Single QR generated:', uris[0].length, 'chars');
+  } else {
+    // Multi-page: show all QRs with page indicators
+    for (let i = 0; i < uris.length; i++) {
+      const wrapper = document.createElement('div');
+      wrapper.style.textAlign = 'center';
+      wrapper.style.marginBottom = '16px';
+
+      const label = document.createElement('div');
+      label.textContent = `Page ${i + 1} of ${uris.length}`;
+      label.style.cssText = 'color:#888;font-size:0.85rem;margin-bottom:8px;';
+      wrapper.appendChild(label);
+
+      const qrDiv = document.createElement('div');
+      QRHandler.generateQR(qrDiv, uris[i], 260);
+      wrapper.appendChild(qrDiv);
+
+      container.appendChild(wrapper);
+    }
+    console.log(`[ELLIPAL] ${uris.length} QR pages generated`);
+  }
+
   showScreen('screenQRShow');
 }
 
@@ -465,12 +506,61 @@ async function scanRecipientQR() {
   }
 }
 
+// ─── ELLIPAL SIGNED QR REASSEMBLY STATE ─────────────────────────────
+let _ellipalSignedPages = {};  // {page: hex_chunk}
+let _ellipalSignedTotal = 0;
+
 async function scanTitanQR() {
   try {
     const result = await openScanner();
-    signedTxHex = result.trim();
-    showToast('Signed TX captured', 'success');
-    await broadcastSignedTx();
+    const trimmed = result.trim();
+
+    // Check if this is an ELLIPAL signed QR
+    if (EllipalBridge.isSignedURI(trimmed)) {
+      const parsed = EllipalBridge.parseSignedQR(trimmed);
+      if (!parsed) {
+        showToast('Could not parse ELLIPAL signed QR', 'error');
+        return;
+      }
+
+      console.log(`[ELLIPAL] Signed QR page ${parsed.page}/${parsed.total}:`, parsed.signedHex.length, 'chars');
+
+      if (parsed.total === 1) {
+        // Single-page signed QR — broadcast directly
+        signedTxHex = parsed.signedHex;
+        showToast('Signed TX captured from ELLIPAL', 'success');
+        logActivity('SIGN', `ELLIPAL signed (${signedTxHex.length} hex chars)`);
+        await broadcastSignedTx();
+      } else {
+        // Multi-page — collect pages
+        _ellipalSignedTotal = parsed.total;
+        _ellipalSignedPages[parsed.page] = parsed.signedHex;
+
+        const collected = Object.keys(_ellipalSignedPages).length;
+        if (collected < parsed.total) {
+          showToast(`Page ${parsed.page}/${parsed.total} captured — scan next page`, 'success');
+          // Auto-open scanner again for next page
+          setTimeout(() => scanTitanQR(), 500);
+        } else {
+          // All pages collected — reassemble
+          let fullHex = '';
+          for (let i = 1; i <= parsed.total; i++) {
+            fullHex += _ellipalSignedPages[i] || '';
+          }
+          signedTxHex = fullHex;
+          _ellipalSignedPages = {};
+          _ellipalSignedTotal = 0;
+          showToast('All pages captured — broadcasting', 'success');
+          logActivity('SIGN', `ELLIPAL signed (${parsed.total} pages, ${signedTxHex.length} hex chars)`);
+          await broadcastSignedTx();
+        }
+      }
+    } else {
+      // Plain hex (manual or non-ELLIPAL signer)
+      signedTxHex = trimmed;
+      showToast('Signed TX captured', 'success');
+      await broadcastSignedTx();
+    }
   } catch (e) {
     if (e.message !== 'cancelled') showToast(e.message, 'error');
   }

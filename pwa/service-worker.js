@@ -4,7 +4,7 @@
  * The PWA must work with zero internet on the sending device.
  */
 
-const CACHE_NAME = 'vergemesh-v2.6';
+const CACHE_NAME = 'vergemesh-v3.1';
 
 const ASSETS = [
   './',
@@ -16,6 +16,7 @@ const ASSETS = [
   './lib/utxo-cache.js',
   './lib/meshtastic-bridge.js',
   './lib/qr-handler.js',
+  './lib/ellipal-bridge.js',
   './icons/icon-192.png',
   './icons/icon-512.png'
 ];
