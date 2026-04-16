@@ -227,9 +227,10 @@ const EllipalBridge = {
    * @param {Object} outputs - {address: amount_in_xvg, ...}
    * @returns {Array<string>} array of QR page URIs (usually 1, sometimes 2+)
    */
-  buildTosignURIs(address, inputs, outputs) {
-    // Build raw unsigned TX (empty scriptSig — cold wallet signs internally)
-    const txHex = this.buildUnsignedTxHex(inputs, outputs);
+  buildTosignURIs(address, inputs, outputs, prebuiltTxHex) {
+    // Use pre-built TX hex if provided, otherwise build fresh
+    // IMPORTANT: the same hex must be stored for TxAssembler sighash computation
+    const txHex = prebuiltTxHex || this.buildUnsignedTxHex(inputs, outputs);
     console.log('[ELLIPAL] Raw unsigned TX hex:', txHex.length, 'chars');
     console.log('[ELLIPAL] TX hex:', txHex);
 

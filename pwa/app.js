@@ -427,7 +427,7 @@ async function buildTransaction() {
 
   // Build the ELLIPAL QR URIs now so we can report page count
   try {
-    window._ellipalURIs = EllipalBridge.buildTosignURIs(s.address, inputs, outputs);
+    window._ellipalURIs = EllipalBridge.buildTosignURIs(s.address, inputs, outputs, window._unsignedTxHex);
   } catch (e) {
     console.error('[ELLIPAL] Failed to build tosign URI:', e);
     showToast('Failed to build ELLIPAL QR: ' + e.message, 'error');
@@ -614,9 +614,10 @@ async function assembleAndBroadcast(rawSignatureHex, senderAddress) {
 
   } catch (e) {
     showSpinner(false);
-    console.error('[ELLIPAL] TX assembly failed:', e);
-    showToast('TX assembly failed: ' + e.message, 'error');
-    logActivity('ERROR', 'TX assembly: ' + e.message);
+    const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : JSON.stringify(e));
+    console.error('[ELLIPAL] TX assembly failed:', msg, e);
+    showToast('TX assembly failed: ' + msg, 'error');
+    logActivity('ERROR', 'TX assembly: ' + msg);
   }
 }
 

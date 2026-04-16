@@ -304,7 +304,8 @@ const TxAssembler = {
           return pubkeyBytes;
         }
       } catch (e) {
-        console.log(`[TxAssembler] Recovery ${recovery} failed:`, e.message);
+        const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : JSON.stringify(e));
+        console.log(`[TxAssembler] Recovery ${recovery} failed:`, msg);
       }
     }
 
@@ -336,11 +337,18 @@ const TxAssembler = {
     console.log('[TxAssembler] s:', sHex);
 
     // Enforce low-S (BIP-62) — if s > n/2, replace with n - s
-    const sig = secp.Signature.fromCompact(rawSignatureHex);
-    let finalSig = sig;
-    if (sig.hasHighS()) {
-      console.log('[TxAssembler] High-S detected, normalizing to low-S');
-      finalSig = new secp.Signature(sig.r, secp.CURVE.n - sig.s);
+    let sig, finalSig;
+    try {
+      sig = secp.Signature.fromCompact(rawSignatureHex);
+      finalSig = sig;
+      if (sig.hasHighS()) {
+        console.log('[TxAssembler] High-S detected, normalizing to low-S');
+        finalSig = new secp.Signature(sig.r, secp.CURVE.n - sig.s);
+      }
+      console.log('[TxAssembler] Signature parsed OK, low-S:', !finalSig.hasHighS());
+    } catch (e) {
+      const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : JSON.stringify(e));
+      throw new Error('Failed to parse signature: ' + msg);
     }
 
     // Get the scriptPubKey for the sender address (P2PKH)
