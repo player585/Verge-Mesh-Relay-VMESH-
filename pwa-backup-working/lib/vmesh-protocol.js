@@ -88,9 +88,6 @@ const VMESH = {
       case 'ERR':
         return { type: 'ERR', sessionId: parts[2], reason: parts[3] };
 
-      case 'UTXO_RESP':
-        return { type: 'UTXO_RESP', sessionId: parts[2], data: parts.slice(3).join(':') };
-
       case 'UTXO_START':
         return { type: 'UTXO_START', sessionId: parts[2], count: parseInt(parts[3]) };
 

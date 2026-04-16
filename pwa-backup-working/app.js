@@ -16,9 +16,6 @@ let scanResolve = null;
 let scanReject = null;
 const activityLog = [];
 
-// ─── UTXO CHUNK REASSEMBLY (for global listener) ──────────────────────────
-const _utxoChunkBuffer = {};  // sessionId → {chunks: {}, total: null}
-
 // ─── SETTINGS (localStorage-backed) ─────────────────────────────────────────
 function getSettings() {
   return {
@@ -186,95 +183,6 @@ function handleIncomingPacket(packet) {
     balEl.textContent = parsed.balance > 0 ? parsed.balance.toFixed(2) : '\u2014';
     document.getElementById('cacheAge').textContent = 'Just now (mesh)';
     showToast(`Balance: ${parsed.balance} XVG`, 'success');
-  }
-
-  // Handle compact UTXO response (single packet, no chunking needed)
-  if (parsed.type === 'UTXO_RESP' && parsed.data) {
-    console.log(`[VMESH] UTXO_RESP received (${parsed.data.length} chars)`);
-    try {
-      const utxos = JSON.parse(parsed.data);
-      UTXOCache.setCache(utxos);
-      updateDashboard();
-      const balance = utxos.reduce((sum, u) => sum + (u.amount || 0), 0);
-      console.log(`[VMESH] UTXOs loaded: ${utxos.length} UTXOs, ${balance.toFixed(2)} XVG`);
-      showToast(`${utxos.length} UTXOs loaded (${balance.toFixed(2)} XVG)`, 'success');
-    } catch (e) {
-      console.error('[VMESH] Failed to parse UTXO_RESP:', e);
-      showToast('Failed to parse UTXO data', 'error');
-    }
-  }
-
-  // Handle UTXO chunked response — reassemble and update cache + balance
-  if (parsed.type === 'UTXO_START' && parsed.sessionId) {
-    _utxoChunkBuffer[parsed.sessionId] = { chunks: {}, total: parsed.count };
-    console.log(`[VMESH] UTXO_START sid=${parsed.sessionId} expecting ${parsed.count} chunks`);
-  }
-
-  if (parsed.type === 'UTXO_DATA' && parsed.sessionId && _utxoChunkBuffer[parsed.sessionId]) {
-    _utxoChunkBuffer[parsed.sessionId].chunks[parsed.index] = parsed.data;
-    console.log(`[VMESH] UTXO_DATA sid=${parsed.sessionId} chunk ${parsed.index}`);
-  }
-
-  if (parsed.type === 'UTXO_END' && parsed.sessionId && _utxoChunkBuffer[parsed.sessionId]) {
-    const buf = _utxoChunkBuffer[parsed.sessionId];
-    const fullJson = Object.keys(buf.chunks)
-      .sort((a, b) => a - b)
-      .map(k => buf.chunks[k])
-      .join('');
-
-    delete _utxoChunkBuffer[parsed.sessionId];
-    console.log(`[VMESH] UTXO reassembled (${fullJson.length} chars): ${fullJson.substring(0, 120)}...`);
-
-    // Verify checksum then update cache
-    VMESH.sha256first8(fullJson).then(hash => {
-      const checksumOk = (hash === parsed.checksum);
-      if (!checksumOk) {
-        console.warn(`[VMESH] UTXO checksum mismatch — expected ${parsed.checksum}, got ${hash}`);
-      }
-
-      try {
-        const utxos = JSON.parse(fullJson);
-        // Accept data even with checksum mismatch if JSON is valid
-        // (LoRa can corrupt non-critical bytes; ELLIPAL verifies the actual TX)
-        UTXOCache.setCache(utxos);
-        updateDashboard();
-        const balance = utxos.reduce((sum, u) => sum + (u.amount || 0), 0);
-        const src = checksumOk ? 'mesh' : 'mesh (checksum warning)';
-        console.log(`[VMESH] UTXOs received via ${src}: ${utxos.length} UTXOs, ${balance.toFixed(2)} XVG`);
-        showToast(`${utxos.length} UTXOs loaded (${balance.toFixed(2)} XVG)`, 'success');
-      } catch (e) {
-        console.error('[VMESH] Failed to parse UTXO JSON:', e, 'Raw:', fullJson.substring(0, 200));
-        showToast('UTXO data corrupted — try again', 'error');
-      }
-    });
-  }
-}
-
-// ─── UPDATE BALANCE (lightweight BAL_REQ over mesh) ────────────────────────
-async function updateBalance() {
-  const s = getSettings();
-  if (!s.address) {
-    showToast('Set your XVG address in Settings first', 'error');
-    showScreen('screenSettings');
-    return;
-  }
-
-  if (!MeshBridge.connected) {
-    showToast('Connect radio first', 'error');
-    return;
-  }
-
-  showSpinner(true, 'Requesting balance via mesh...');
-  const sessionId = VMESH.generateSessionId();
-
-  try {
-    await MeshBridge.sendText(VMESH.buildBalReq(sessionId, s.address));
-    logActivity('TX', `BAL_REQ via mesh`);
-    showToast('Balance request sent — waiting for response...', 'success');
-  } catch (e) {
-    showToast('Failed to send balance request: ' + e.message, 'error');
-  } finally {
-    showSpinner(false);
   }
 }
 

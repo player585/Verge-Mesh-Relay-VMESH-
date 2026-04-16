@@ -266,9 +266,17 @@ def handle_utxo_req(session_id: str, address: str, interface):
             })
 
         data = json.dumps(minimal, separators=(',', ':'))
-        send_chunked("VMESH:UTXO", session_id, data, interface)
+
+        # If data fits in a single message (<180 chars), send compact UTXO_RESP
+        # This avoids the 3-packet START/DATA/END sequence that BLE often drops
+        if len(data) <= 180:
+            interface.sendText(f"VMESH:UTXO_RESP:{session_id}:{data}")
+            log.info(f"Sent {len(minimal)} UTXOs (compact) for {address[:12]}...")
+        else:
+            send_chunked("VMESH:UTXO", session_id, data, interface)
+            log.info(f"Sent {len(minimal)} UTXOs (chunked) for {address[:12]}...")
+
         stats["utxo_served"] += 1
-        log.info(f"Sent {len(minimal)} UTXOs for {address[:12]}...")
 
     except Exception as e:
         log.error(f"UTXO fetch failed: {e}")
