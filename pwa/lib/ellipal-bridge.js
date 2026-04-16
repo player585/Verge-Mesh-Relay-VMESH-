@@ -18,7 +18,7 @@ const EllipalBridge = {
   CHAIN_TYPE: 'XVG',     // Verge chain identifier
   TOKEN_SYMBOL: 'XVG',   // Native coin
   DECIMALS: '8',          // 8 decimal places (satoshi precision)
-  MAX_QR_BYTES: 140,      // ELLIPAL splits QR pages at ~140 chars for BTC-type
+  MAX_QR_BYTES: 350,      // Max base64 chars per QR page (140 in ELLIPAL's web app, but EC02 camera handles larger QRs fine)
   SATS_PER_COIN: 1e8,     // 100,000,000 satoshis per XVG
 
   // ─── Raw TX Builder (Bitcoin serialization) ───────────────────────────
@@ -117,17 +117,15 @@ const EllipalBridge = {
   /**
    * Build a raw unsigned Bitcoin-format transaction hex
    *
-   * For ELLIPAL signing, each input's scriptSig field must contain the
-   * scriptPubKey of the previous output (P2PKH script derived from the
-   * sender's address). This is the standard Bitcoin signing preparation
-   * format that hardware wallets expect.
+   * ScriptSig is empty (0x00) for each input — the ELLIPAL cold wallet
+   * holds the private key and derives the signing script internally.
+   * This matches what createrawtransaction produces on a Verge node.
    *
    * @param {Array} inputs  - [{txid, vout}]
    * @param {Object} outputs - {address: amount_in_xvg, ...}
-   * @param {string} senderAddress - sender's XVG address (for scriptSig)
    * @returns {string} hex-encoded unsigned transaction
    */
-  buildUnsignedTxHex(inputs, outputs, senderAddress) {
+  buildUnsignedTxHex(inputs, outputs) {
     let hex = '';
 
     // Version (4 bytes LE) — Verge uses version 1
@@ -141,19 +139,14 @@ const EllipalBridge = {
     // Input count (varint)
     hex += this.varint(inputs.length);
 
-    // Build the sender's P2PKH scriptPubKey for use in scriptSig fields
-    // (standard Bitcoin signing preparation: place prevout script in scriptSig)
-    const senderScript = this.addressToScriptPubKey(senderAddress);
-
     // Inputs
     for (const input of inputs) {
       // Previous tx hash (32 bytes, internal byte order = reversed)
       hex += this.reverseHex(input.txid);
       // Previous output index (4 bytes LE)
       hex += this.intToLE(input.vout, 4);
-      // ScriptSig = previous output's scriptPubKey (for signing preparation)
-      hex += this.varint(senderScript.length / 2);
-      hex += senderScript;
+      // ScriptSig length (0 for unsigned — cold wallet fills this during signing)
+      hex += '00';
       // Sequence (4 bytes, 0xffffffff = final)
       hex += 'ffffffff';
     }
@@ -235,8 +228,8 @@ const EllipalBridge = {
    * @returns {Array<string>} array of QR page URIs (usually 1, sometimes 2+)
    */
   buildTosignURIs(address, inputs, outputs) {
-    // Build raw unsigned TX (address needed for scriptSig in signing prep)
-    const txHex = this.buildUnsignedTxHex(inputs, outputs, address);
+    // Build raw unsigned TX (empty scriptSig — cold wallet signs internally)
+    const txHex = this.buildUnsignedTxHex(inputs, outputs);
     console.log('[ELLIPAL] Raw unsigned TX hex:', txHex.length, 'chars');
     console.log('[ELLIPAL] TX hex:', txHex);
 
