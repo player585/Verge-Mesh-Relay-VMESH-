@@ -435,10 +435,14 @@ const MeshBridge = {
 
   async _drainFromRadio() {
     // Prevent concurrent drains (polling + notification can overlap)
-    if (this._drainActive) return;
+    if (this._drainActive) {
+      this._drainPending = true; // re-drain after current finishes
+      return;
+    }
     this._drainActive = true;
 
     let emptyCount = 0;
+    let errorCount = 0;
     try {
       for (let i = 0; i < 50; i++) {
         try {
@@ -451,6 +455,7 @@ const MeshBridge = {
             continue;
           }
           emptyCount = 0;
+          errorCount = 0;
 
           const parsed = this._parseFromRadio(buf);
 
@@ -469,14 +474,24 @@ const MeshBridge = {
             }
           }
         } catch (e) {
-          // Silently break on read errors (normal when no data available)
-          break;
+          // BLE reads can throw transient GATT errors — retry a few times
+          // before giving up (there may be more packets after the bad read)
+          errorCount++;
+          if (errorCount > 3) break;
+          await new Promise(r => setTimeout(r, 50));
         }
       }
     } finally {
       this._drainActive = false;
+      // If a notification or poll came in while we were draining, go again
+      if (this._drainPending) {
+        this._drainPending = false;
+        this._drainFromRadio();
+      }
     }
   },
+
+  _drainPending: false,
 
   // ── Serial Connection (USB) ───────────────────────────────────────
 
@@ -681,6 +696,9 @@ const MeshBridge = {
       const { bytes } = this._buildToRadioPacket(text, 0xFFFFFFFF, 0);
       await this._toRadio.writeValue(bytes);
       console.log('[MeshBridge] Sent via BLE:', text.substring(0, 60));
+      // Kick off a drain shortly after sending — the radio may queue
+      // a routing ACK or the gateway may respond within seconds
+      setTimeout(() => this._drainFromRadio(), 500);
     } else if (this.connectionType === 'serial') {
       const { bytes } = this._buildToRadioPacket(text, 0xFFFFFFFF, 0);
       const framed = this._frameSerialPacket(bytes);
@@ -712,7 +730,8 @@ const MeshBridge = {
         clearInterval(this._blePollingInterval);
         this._blePollingInterval = null;
       }
-    }, 3000); // Poll every 3 seconds
+    }, 1000); // Poll every 1 second — must be fast enough to catch
+             // multi-packet sequences (UTXO_START→DATA→END arrive 2s apart)
   },
 
   async disconnect() {
