@@ -187,3 +187,5 @@ To demonstrate the full mesh relay visually:
 | v3.3 | Fix scanner race condition: closeScanner no longer rejects before scanResolve fires |
 | v3.4 | BLE GATT write retry (3 attempts with backoff), gateway rate limiter removed from TX flow |
 | v3.5 | TX assembler: ELLIPAL returns raw r\|\|s signature, not complete TX. Added secp256k1 pubkey recovery, DER encoding, scriptSig assembly in PWA |
+| v3.5.1 | Fix nTime mismatch: buildTosignURIs now reuses stored unsignedTxHex, improved error handling |
+| v3.6 | Multi-approach sighash: tries 4 sighash variants (with/without nTime, single/double SHA-256) × 2 recovery IDs to match ELLIPAL's signing behavior |
