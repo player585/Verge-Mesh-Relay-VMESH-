@@ -353,12 +353,12 @@
     console.log = function(...args) {
       _origLog.apply(console, args);
       const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
-      if (msg.includes('MeshBridge') || msg.includes('VMESH')) debugAppend(msg, '#0f0');
+      if (msg.includes('MeshBridge') || msg.includes('VMESH') || msg.includes('ELLIPAL')) debugAppend(msg, '#0f0');
     };
     console.warn = function(...args) {
       _origWarn.apply(console, args);
       const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
-      if (msg.includes('MeshBridge') || msg.includes('VMESH')) debugAppend(msg, '#ff0');
+      if (msg.includes('MeshBridge') || msg.includes('VMESH') || msg.includes('ELLIPAL')) debugAppend(msg, '#ff0');
     };
     console.error = function(...args) {
       _origErr.apply(console, args);

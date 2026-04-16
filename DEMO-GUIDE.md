@@ -151,17 +151,20 @@ To demonstrate the full mesh relay visually:
     - Phone → BLE → T-Echo → LoRa → Heltec → Pi → Verge Network
 16. Wait for the ACK from the gateway confirming broadcast
 
-**ELLIPAL QR Format (v3.1):**
+**ELLIPAL QR Format (v3.2):**
 - Uses `elp://tosign/XVG/address/base64_tx/XVG/8` URI scheme
 - TX version 1 (standard Verge format)
 - Includes nTime timestamp field (Verge-specific, PeerCoin heritage)
-- ScriptSig contains sender's P2PKH scriptPubKey (signing preparation)
+- ScriptSig is empty (0x00) — ELLIPAL cold wallet derives the signing script internally from its own keys
 - Base64 uses modified encoding: `/` replaced with `_`
-- Multi-page QRs split at 140-character boundaries
+- MAX_QR_BYTES = 350 (up from 140) — typical 1-input/2-output TX fits in a single 222-char QR
+- Multi-page QRs only needed for very large transactions (3+ inputs)
 
 ### ELLIPAL "signature data parsing failed"
-- **Fixed in v3.1** — this was caused by TX version 2 (should be 1) and empty scriptSig
-- Clear site data on phone to get the v3.1 update
+- **v3.0** — caused by TX version 2 (should be 1)
+- **v3.1** — fixed version to 1, added P2PKH scriptPubKey in scriptSig (still failed for dual QR scanning)
+- **v3.2** — reverted scriptSig to empty (matches what createrawtransaction produces), increased MAX_QR_BYTES 140→350 so typical TX generates a single QR code
+- Clear site data on phone to get the latest update
 - If still failing, check that the ELLIPAL firmware supports XVG (v2.3.0+ confirmed)
 
 ---
@@ -173,3 +176,4 @@ To demonstrate the full mesh relay visually:
 | v2.6 | Compact UTXO_RESP, checksum tolerance |
 | v3.0 | ELLIPAL bridge: QR generation + signed QR parsing |
 | v3.1 | Fix ELLIPAL parsing: TX version 1, P2PKH scriptSig in inputs |
+| v3.2 | Fix dual QR scanning: revert to empty scriptSig, MAX_QR_BYTES 140→350, single QR for typical TX |

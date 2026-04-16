@@ -512,22 +512,26 @@ let _ellipalSignedTotal = 0;
 
 async function scanTitanQR() {
   try {
+    console.log('[ELLIPAL] scanTitanQR: opening scanner...');
     const result = await openScanner();
     const trimmed = result.trim();
+    console.log('[ELLIPAL] Scanned QR data (' + trimmed.length + ' chars):', trimmed.substring(0, 80) + '...');
 
     // Check if this is an ELLIPAL signed QR
     if (EllipalBridge.isSignedURI(trimmed)) {
       const parsed = EllipalBridge.parseSignedQR(trimmed);
       if (!parsed) {
+        console.error('[ELLIPAL] parseSignedQR returned null for:', trimmed.substring(0, 120));
         showToast('Could not parse ELLIPAL signed QR', 'error');
         return;
       }
 
-      console.log(`[ELLIPAL] Signed QR page ${parsed.page}/${parsed.total}:`, parsed.signedHex.length, 'chars');
+      console.log(`[ELLIPAL] Signed QR page ${parsed.page}/${parsed.total}: ${parsed.signedHex.length} hex chars, chain=${parsed.chainType}, addr=${parsed.address}`);
 
       if (parsed.total === 1) {
         // Single-page signed QR — broadcast directly
         signedTxHex = parsed.signedHex;
+        console.log('[ELLIPAL] Single-page signed TX captured:', signedTxHex.length, 'hex chars');
         showToast('Signed TX captured from ELLIPAL', 'success');
         logActivity('SIGN', `ELLIPAL signed (${signedTxHex.length} hex chars)`);
         await broadcastSignedTx();
@@ -537,6 +541,7 @@ async function scanTitanQR() {
         _ellipalSignedPages[parsed.page] = parsed.signedHex;
 
         const collected = Object.keys(_ellipalSignedPages).length;
+        console.log(`[ELLIPAL] Multi-page: collected ${collected}/${parsed.total}`);
         if (collected < parsed.total) {
           showToast(`Page ${parsed.page}/${parsed.total} captured — scan next page`, 'success');
           // Auto-open scanner again for next page
@@ -550,6 +555,7 @@ async function scanTitanQR() {
           signedTxHex = fullHex;
           _ellipalSignedPages = {};
           _ellipalSignedTotal = 0;
+          console.log('[ELLIPAL] All pages reassembled:', signedTxHex.length, 'hex chars');
           showToast('All pages captured — broadcasting', 'success');
           logActivity('SIGN', `ELLIPAL signed (${parsed.total} pages, ${signedTxHex.length} hex chars)`);
           await broadcastSignedTx();
@@ -557,11 +563,13 @@ async function scanTitanQR() {
       }
     } else {
       // Plain hex (manual or non-ELLIPAL signer)
+      console.log('[ELLIPAL] Non-ELLIPAL QR — treating as raw hex:', trimmed.length, 'chars');
       signedTxHex = trimmed;
       showToast('Signed TX captured', 'success');
       await broadcastSignedTx();
     }
   } catch (e) {
+    console.log('[ELLIPAL] scanTitanQR error:', e.message);
     if (e.message !== 'cancelled') showToast(e.message, 'error');
   }
 }
@@ -580,8 +588,13 @@ function openScanner() {
       videoEl,
       canvasEl,
       (result) => {
-        closeScanner();
-        if (scanResolve) scanResolve(result);
+        // Success: stop scanner, resolve the promise, then navigate
+        QRHandler.stopScanner();
+        const res = scanResolve;
+        scanResolve = null;
+        scanReject = null;
+        if (res) res(result);
+        // Don't navigate here — let the caller (scanTitanQR/scanRecipientQR) handle it
       },
       (status) => {
         document.getElementById('scannerStatus').textContent = status;
@@ -595,11 +608,16 @@ function openScanner() {
 
 function closeScanner() {
   QRHandler.stopScanner();
-  showScreen(currentScreen === 'screenScanner' ? 'screenSend' : currentScreen);
+  // Navigate away from scanner screen
+  if (currentScreen === 'screenScanner') {
+    showScreen('screenQRShow');
+  }
+  // Only reject if the promise is still pending (user cancelled manually)
   if (scanReject) {
-    scanReject(new Error('cancelled'));
+    const rej = scanReject;
     scanResolve = null;
     scanReject = null;
+    rej(new Error('cancelled'));
   }
 }
 
