@@ -222,13 +222,15 @@ const TxAssembler = {
   //   3. Append SIGHASH_ALL as 4 bytes LE
   //   4. Double SHA-256 the result
 
-  async computeSighash(unsignedTxHex, inputIndex, scriptPubKey) {
+  async computeSighash(unsignedTxHex, inputIndex, scriptPubKey, opts = {}) {
     const parsed = this.parseUnsignedTx(unsignedTxHex);
 
     // Rebuild the TX with the signing script in the correct input
     let hex = '';
     hex += parsed.version;
-    hex += parsed.nTime;
+    if (!opts.skipNTime) {
+      hex += parsed.nTime;
+    }
     hex += this.varint(parsed.inputs.length);
 
     for (let i = 0; i < parsed.inputs.length; i++) {
@@ -259,7 +261,10 @@ const TxAssembler = {
     // Append SIGHASH_ALL as 4 bytes LE
     hex += this.intToLE(this.SIGHASH_ALL, 4);
 
-    // Double SHA-256
+    // SHA-256 (single or double based on opts)
+    if (opts.singleHash) {
+      return await this.sha256(hex);
+    }
     return await this.doubleSha256(hex);
   },
 
@@ -325,18 +330,16 @@ const TxAssembler = {
     const secp = window.nobleSecp256k1;
     if (!secp) throw new Error('noble-secp256k1 not loaded');
 
-    // Validate signature length (should be 128 hex chars = 64 bytes = r + s)
+    // 1. Parse and validate signature (r, s), normalize low-S
     if (rawSignatureHex.length !== 128) {
       throw new Error(`Expected 128 hex char signature (r||s), got ${rawSignatureHex.length}`);
     }
 
-    // Split into r and s
     const rHex = rawSignatureHex.substring(0, 64);
     const sHex = rawSignatureHex.substring(64, 128);
     console.log('[TxAssembler] r:', rHex);
     console.log('[TxAssembler] s:', sHex);
 
-    // Enforce low-S (BIP-62) — if s > n/2, replace with n - s
     let sig, finalSig;
     try {
       sig = secp.Signature.fromCompact(rawSignatureHex);
@@ -351,35 +354,98 @@ const TxAssembler = {
       throw new Error('Failed to parse signature: ' + msg);
     }
 
-    // Get the scriptPubKey for the sender address (P2PKH)
+    // 2. Get scriptPubKey from sender address
     const scriptPubKey = EllipalBridge.addressToScriptPubKey(senderAddress);
     console.log('[TxAssembler] ScriptPubKey:', scriptPubKey);
 
-    // Parse the unsigned TX to understand its structure
+    // 3. Parse unsigned TX
     const parsed = this.parseUnsignedTx(unsignedTxHex);
     console.log('[TxAssembler] TX has', parsed.inputs.length, 'inputs,', parsed.outputs.length, 'outputs');
 
-    // For each input, compute sighash and recover pubkey
-    // (For now we assume all inputs are from the same address — typical for ELLIPAL)
+    // 4. Decode sender address to get expected hash160
+    const decoded = EllipalBridge.base58CheckDecode(senderAddress);
+    const expectedHash160 = this.bytesToHex(decoded.slice(1));
+    console.log('[TxAssembler] Expected hash160:', expectedHash160);
+
+    // Build compact signature hex for recovery (use original r||s, not low-S)
+    const compactSig = rHex + sHex;
+
+    // 5. Try multiple sighash approaches to find one where pubkey recovery matches
+    const approaches = [
+      { skipNTime: false, singleHash: false, name: 'Verge (nTime+dSHA256)' },
+      { skipNTime: true,  singleHash: false, name: 'BTC (no nTime+dSHA256)' },
+      { skipNTime: false, singleHash: true,  name: 'Verge (nTime+SHA256)' },
+      { skipNTime: true,  singleHash: true,  name: 'BTC (no nTime+SHA256)' },
+    ];
+
     const scriptSigs = [];
     let recoveredPubkey = null;
 
     for (let i = 0; i < parsed.inputs.length; i++) {
       console.log(`[TxAssembler] Processing input ${i}...`);
 
-      // Compute sighash for this input
-      const sighash = await this.computeSighash(unsignedTxHex, i, scriptPubKey);
-
-      // Recover public key (only need to do this once if all inputs use same address)
       if (!recoveredPubkey) {
-        recoveredPubkey = await this.recoverPubkey(sighash, rHex, sHex, senderAddress);
+        let found = false;
+        const attemptLog = [];
+
+        for (const approach of approaches) {
+          const sighash = await this.computeSighash(unsignedTxHex, i, scriptPubKey, {
+            skipNTime: approach.skipNTime,
+            singleHash: approach.singleHash,
+          });
+          const sighashHex = this.bytesToHex(sighash);
+
+          for (let recovery = 0; recovery < 2; recovery++) {
+            try {
+              const pubkeyBytes = secp.recoverPublicKey(
+                sighashHex,
+                compactSig,
+                recovery,
+                true  // compressed
+              );
+
+              if (!pubkeyBytes) {
+                const msg = `${approach.name} recovery=${recovery}: no pubkey returned`;
+                console.log(`[TxAssembler] ${msg}`);
+                attemptLog.push(msg);
+                continue;
+              }
+
+              const pubkeyHash = await this.hash160(pubkeyBytes);
+              const recoveredHash160 = this.bytesToHex(pubkeyHash);
+              const pubkeyPrefix = this.bytesToHex(pubkeyBytes).substring(0, 20);
+              const match = recoveredHash160 === expectedHash160;
+
+              console.log(`[TxAssembler] ${approach.name} recovery=${recovery}: sighash=${sighashHex} pubkey=${pubkeyPrefix}... hash160=${recoveredHash160} expected=${expectedHash160} match=${match}`);
+              attemptLog.push(`${approach.name} recovery=${recovery}: hash160=${recoveredHash160} match=${match}`);
+
+              if (match) {
+                console.log(`[TxAssembler] ✓ Pubkey recovered with ${approach.name}, recovery=${recovery}`);
+                recoveredPubkey = pubkeyBytes;
+                found = true;
+                break;
+              }
+            } catch (e) {
+              const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : JSON.stringify(e));
+              console.log(`[TxAssembler] ${approach.name} recovery=${recovery}: error: ${msg}`);
+              attemptLog.push(`${approach.name} recovery=${recovery}: error: ${msg}`);
+            }
+          }
+
+          if (found) break;
+        }
+
+        if (!found) {
+          throw new Error(
+            'Could not recover public key matching sender address. Attempts:\n' +
+            attemptLog.join('\n')
+          );
+        }
       }
 
-      // DER-encode the (possibly low-S normalized) signature
+      // 7. Build scriptSig with finalSig (low-S DER) + recovered pubkey
       const derSig = finalSig.toDERRawBytes();
       const derHex = this.bytesToHex(derSig);
-
-      // Build scriptSig: <len(DER+0x01)> <DER_sig> <0x01 SIGHASH_ALL> <0x21 pubkey_len> <compressed_pubkey>
       const pubkeyHex = this.bytesToHex(recoveredPubkey);
       const sigWithHashType = derHex + '01'; // DER sig + SIGHASH_ALL byte
 
@@ -392,7 +458,7 @@ const TxAssembler = {
       console.log(`[TxAssembler] Input ${i} scriptSig: ${scriptSig.length} hex chars`);
     }
 
-    // Reconstruct the TX with scriptSigs inserted
+    // 8. Reconstruct signed TX
     let signedHex = '';
     signedHex += parsed.version;
     signedHex += parsed.nTime;

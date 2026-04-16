@@ -4,7 +4,7 @@
  * The PWA must work with zero internet on the sending device.
  */
 
-const CACHE_NAME = 'vergemesh-v3.5.1';
+const CACHE_NAME = 'vmesh-v3.6';
 
 const ASSETS = [
   './',
