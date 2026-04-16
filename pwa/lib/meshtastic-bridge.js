@@ -694,8 +694,23 @@ const MeshBridge = {
 
     if (this.connectionType === 'ble') {
       const { bytes } = this._buildToRadioPacket(text, 0xFFFFFFFF, 0);
-      await this._toRadio.writeValue(bytes);
-      console.log('[MeshBridge] Sent via BLE:', text.substring(0, 60));
+      // BLE GATT writes are flaky — retry up to 3 times with backoff
+      let lastErr;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await this._toRadio.writeValue(bytes);
+          console.log('[MeshBridge] Sent via BLE:', text.substring(0, 60));
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          console.warn(`[MeshBridge] BLE write attempt ${attempt}/3 failed:`, e.message);
+          if (attempt < 3) {
+            await new Promise(r => setTimeout(r, 500 * attempt));
+          }
+        }
+      }
+      if (lastErr) throw new Error(`BLE write failed after 3 attempts: ${lastErr.message}`);
       // Kick off a drain shortly after sending — the radio may queue
       // a routing ACK or the gateway may respond within seconds
       setTimeout(() => this._drainFromRadio(), 500);
