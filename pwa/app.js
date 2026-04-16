@@ -418,8 +418,12 @@ async function buildTransaction() {
     ...(selection.change > 0.00001 ? { [s.address]: selection.change } : {})
   };
 
-  // Store structured TX data for ELLIPAL QR generation
+  // Store structured TX data for ELLIPAL QR generation and TX assembly
   window._pendingTx = { inputs, outputs, address: s.address };
+
+  // Build and store the unsigned TX hex — needed later by TxAssembler
+  window._unsignedTxHex = EllipalBridge.buildUnsignedTxHex(inputs, outputs);
+  console.log('[ELLIPAL] Stored unsigned TX hex:', window._unsignedTxHex.length, 'chars');
 
   // Build the ELLIPAL QR URIs now so we can report page count
   try {
@@ -529,12 +533,11 @@ async function scanTitanQR() {
       console.log(`[ELLIPAL] Signed QR page ${parsed.page}/${parsed.total}: ${parsed.signedHex.length} hex chars, chain=${parsed.chainType}, addr=${parsed.address}`);
 
       if (parsed.total === 1) {
-        // Single-page signed QR — broadcast directly
-        signedTxHex = parsed.signedHex;
-        console.log('[ELLIPAL] Single-page signed TX captured:', signedTxHex.length, 'hex chars');
-        showToast('Signed TX captured from ELLIPAL', 'success');
-        logActivity('SIGN', `ELLIPAL signed (${signedTxHex.length} hex chars)`);
-        await broadcastSignedTx();
+        // Single-page signed QR
+        console.log('[ELLIPAL] Single-page raw signature:', parsed.signedHex.length, 'hex chars');
+        showToast('Signature captured — assembling TX...', 'success');
+        logActivity('SIGN', `ELLIPAL signed (${parsed.signedHex.length} hex chars)`);
+        await assembleAndBroadcast(parsed.signedHex, parsed.address);
       } else {
         // Multi-page — collect pages
         _ellipalSignedTotal = parsed.total;
@@ -547,23 +550,22 @@ async function scanTitanQR() {
           // Auto-open scanner again for next page
           setTimeout(() => scanTitanQR(), 500);
         } else {
-          // All pages collected — reassemble
+          // All pages collected — reassemble raw signature
           let fullHex = '';
           for (let i = 1; i <= parsed.total; i++) {
             fullHex += _ellipalSignedPages[i] || '';
           }
-          signedTxHex = fullHex;
           _ellipalSignedPages = {};
           _ellipalSignedTotal = 0;
-          console.log('[ELLIPAL] All pages reassembled:', signedTxHex.length, 'hex chars');
-          showToast('All pages captured — broadcasting', 'success');
-          logActivity('SIGN', `ELLIPAL signed (${parsed.total} pages, ${signedTxHex.length} hex chars)`);
-          await broadcastSignedTx();
+          console.log('[ELLIPAL] All pages reassembled:', fullHex.length, 'hex chars');
+          showToast('All pages captured — assembling TX...', 'success');
+          logActivity('SIGN', `ELLIPAL signed (${parsed.total} pages, ${fullHex.length} hex chars)`);
+          await assembleAndBroadcast(fullHex, parsed.address);
         }
       }
     } else {
-      // Plain hex (manual or non-ELLIPAL signer)
-      console.log('[ELLIPAL] Non-ELLIPAL QR — treating as raw hex:', trimmed.length, 'chars');
+      // Plain hex (manual or non-ELLIPAL signer) — assume already a complete signed TX
+      console.log('[ELLIPAL] Non-ELLIPAL QR — treating as complete signed TX:', trimmed.length, 'chars');
       signedTxHex = trimmed;
       showToast('Signed TX captured', 'success');
       await broadcastSignedTx();
@@ -571,6 +573,50 @@ async function scanTitanQR() {
   } catch (e) {
     console.log('[ELLIPAL] scanTitanQR error:', e.message);
     if (e.message !== 'cancelled') showToast(e.message, 'error');
+  }
+}
+
+/**
+ * Assemble a complete signed TX from ELLIPAL's raw signature + the stored unsigned TX,
+ * then broadcast it.
+ *
+ * ELLIPAL returns raw ECDSA signature (r || s = 128 hex chars = 64 bytes).
+ * We use TxAssembler to:
+ *   1. Compute sighash from the unsigned TX
+ *   2. Recover the public key from the signature
+ *   3. DER-encode the signature
+ *   4. Build scriptSig and insert into the TX
+ */
+async function assembleAndBroadcast(rawSignatureHex, senderAddress) {
+  try {
+    // Verify we have the unsigned TX stored from buildTransaction()
+    if (!window._unsignedTxHex) {
+      throw new Error('No unsigned TX found — rebuild the transaction first');
+    }
+
+    console.log('[ELLIPAL] Assembling signed TX from raw signature...');
+    showSpinner(true, 'Assembling signed transaction...');
+
+    // Use TxAssembler to build the complete signed TX
+    const completeTxHex = await TxAssembler.buildSignedTx(
+      window._unsignedTxHex,
+      rawSignatureHex,
+      senderAddress
+    );
+
+    signedTxHex = completeTxHex;
+    console.log('[ELLIPAL] ✓ Complete signed TX:', signedTxHex.length, 'hex chars');
+    logActivity('ASSEMBLE', `TX assembled (${signedTxHex.length} hex chars)`);
+    showSpinner(false);
+
+    // Now broadcast the complete signed TX
+    await broadcastSignedTx();
+
+  } catch (e) {
+    showSpinner(false);
+    console.error('[ELLIPAL] TX assembly failed:', e);
+    showToast('TX assembly failed: ' + e.message, 'error');
+    logActivity('ERROR', 'TX assembly: ' + e.message);
   }
 }
 
